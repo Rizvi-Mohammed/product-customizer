@@ -1,0 +1,24 @@
+{
+  "product_customizer": {
+    "name": "Product image customizer",
+    "heading": "Customize {{ product_title }}",
+    "subtitle": "Add accessories to build your perfect set.",
+    "accessories_label": "Accessories",
+    "sold_out": "Sold out",
+    "no_accessories": "Configure accessories in the Product Image Customizer app - nothing in the theme editor will change the canvas.",
+    "selection_title": "Selected accessories",
+    "selection_empty": "No accessories selected yet.",
+    "selection_separator": ", ",
+    "add_to_cart": "Add to cart",
+    "adding_to_cart": "Adding to cart...",
+    "added_to_cart": "Added to cart.",
+    "add_to_cart_error": "Could not add to cart. Try again.",
+    "base_sold_out": "Base product is sold out.",
+    "settings": {
+      "base_product": "Base product",
+      "base_product_label": "Base product",
+      "accessories": "Accessories",
+      "accessories_label": "Accessories list"
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{% comment %}
+Accessory Picker Block
+- Reads product metafields (namespace productCustomizer) for:
+  - accessories: list.product_reference
+  - variant_accessory_images: json map baseVariantId -> accessoryProductId -> { fileUrl, fileId }
+- Renders accessory tiles and wires up JS to swap main image when an accessory is clicked for the current variant.
+{% endcomment %}
+
+{% liquid
+  assign accessories_meta = product.metafields.productCustomizer.accessories
+  assign color_map_meta = product.metafields.productCustomizer.color_combination_images
+  assign metaobject_ref = product.metafields.productCustomizer.image_customization
+%}
+
+{% if accessories_meta == blank %}
+  <div class="accessory-picker accessory-picker--empty">No accessories configured.</div>
+{% else %}
+  {% assign accessories = accessories_meta.value %}
+  {% if metaobject_ref and metaobject_ref.value != blank %}
+    {% assign ic = metaobject_ref.value %}
+    {% assign color_map_source = ic.color_map.value | default: ic.color_map %}
+  {% else %}
+    {% assign color_map_source = color_map_meta.value %}
+  {% endif %}
+  {% assign color_map_json = color_map_source | default: '{}' | replace: '=>', ':' | replace: '\"', '"' | replace: '\"', '"' %}
+
+  {{ 'accessory-picker.css' | asset_url | stylesheet_tag }}
+  <script src="{{ 'accessory-picker.js' | asset_url }}" defer></script>
+
+  <div
+    class="accessory-picker"
+    data-accessory-picker
+    data-color-map="script"
+    data-product-id="{{ product.id }}"
+  >
+    <script type="application/json" data-color-map-script>{{ color_map_json }}</script>
+      <div class="accessory-picker__header">
+        <h3 class="accessory-picker__title">{{ 'product_customizer.accessories_label' | t }}</h3>
+      </div>
+
+      <div class="accessory-picker__list" role="list">
+        {% for accessory in accessories %}
+          <button
+            type="button"
+            class="accessory-picker__item"
+            data-accessory-gid="{{ accessory.admin_graphql_api_id | default: accessory.id }}"
+            data-accessory-id="{{ accessory.id }}"
+            data-accessory-variant-id="{{ accessory.selected_or_first_available_variant.id | default: accessory.variants.first.id }}"
+            role="listitem"
+          >
+            <div class="accessory-picker__thumb">
+              {% if accessory.featured_image %}
+                <img
+                  src="{{ accessory.featured_image | image_url: width: 320, height: 320, crop: 'center' }}"
+                  alt="{{ accessory.title | escape }}"
+                  width="320"
+                  height="320"
+                >
+              {% endif %}
+            </div>
+          <div class="accessory-picker__content">
+            <div class="accessory-picker__name">{{ accessory.title }}</div>
+            <div class="accessory-picker__price">{{ accessory.price | money }}</div>
+          </div>
+        </button>
+      {% endfor %}
+    </div>
+  </div>
+{% endif %}
+
+{% schema %}
+{
+  "name": "Accessory picker",
+  "target": "section",
+  "templates": ["product"],
+  "settings": []
+}
+{% endschema %}
