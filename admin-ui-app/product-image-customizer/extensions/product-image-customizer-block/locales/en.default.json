@@ -14,6 +14,13 @@
     "added_to_cart": "Added to cart.",
     "add_to_cart_error": "Could not add to cart. Try again.",
     "base_sold_out": "Base product is sold out.",
+    "choose_accessories": "Choose accessories",
+    "variant_label": "Choose variant",
+    "category_label": "Category",
+    "category_none_option": "None",
+    "category_combination_label": "Category combinations",
+    "category_selector_label": "Choose by category",
+    "curated_label": "Curated for this item",
     "settings": {
       "base_product": "Base product",
       "base_product_label": "Base product",

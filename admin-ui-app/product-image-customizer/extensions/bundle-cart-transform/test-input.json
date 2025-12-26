@@ -1,0 +1,78 @@
+{
+  "cart": {
+    "lines": [
+      {
+        "id": "gid://shopify/CartLine/1",
+        "quantity": 1,
+        "bundleGroupId": {
+          "value": null
+        },
+        "bundleGroupIdAlt": {
+          "value": "bundle-1766223108889-t6pwr8"
+        },
+        "bundleRole": {
+          "value": null
+        },
+        "bundleRoleAlt": {
+          "value": "component"
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "id": "gid://shopify/ProductVariant/123",
+          "product": {
+            "id": "gid://shopify/Product/1",
+            "title": "Silver Pheasant Tail Hat Feather"
+          }
+        }
+      },
+      {
+        "id": "gid://shopify/CartLine/2",
+        "quantity": 1,
+        "bundleGroupId": {
+          "value": null
+        },
+        "bundleGroupIdAlt": {
+          "value": "bundle-1766223108889-t6pwr8"
+        },
+        "bundleRole": {
+          "value": null
+        },
+        "bundleRoleAlt": {
+          "value": "component"
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "id": "gid://shopify/ProductVariant/456",
+          "product": {
+            "id": "gid://shopify/Product/2",
+            "title": "Teddy Cattleman Cowboy Hat"
+          }
+        }
+      },
+      {
+        "id": "gid://shopify/CartLine/3",
+        "quantity": 1,
+        "bundleGroupId": {
+          "value": null
+        },
+        "bundleGroupIdAlt": {
+          "value": "bundle-1766223108889-t6pwr8"
+        },
+        "bundleRole": {
+          "value": null
+        },
+        "bundleRoleAlt": {
+          "value": "parent"
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "id": "gid://shopify/ProductVariant/789",
+          "product": {
+            "id": "gid://shopify/Product/3",
+            "title": "CREATE YOUR BUNDLE"
+          }
+        }
+      }
+    ]
+  }
+}

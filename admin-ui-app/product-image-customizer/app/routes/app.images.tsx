@@ -24,6 +24,12 @@ const { Picker, PickerCreate, ResourceType } = AppBridgeActions as any;
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 
+/**
+ * @deprecated This route uses the old metafield-based approach.
+ * Use app._index.tsx instead for the new metaobject-based ruleset system.
+ * This route will be removed in a future version.
+ */
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
 

@@ -1,0 +1,21 @@
+{% comment %}
+  Renders bundle component properties for cart line items
+  
+  Usage:
+  {% render 'bundle-properties-display', item: cart_item %}
+{% endcomment %}
+
+{% if item.properties.size > 0 %}
+  <div class="bundle-properties" style="margin-top: 0.5rem; font-size: 0.875rem; color: #666;">
+    {% for property in item.properties %}
+      {% assign property_first_char = property.first | slice: 0 %}
+      
+      {% comment %} Skip properties that start with underscore (internal use) {% endcomment %}
+      {% unless property_first_char == '_' %}
+        <div class="bundle-property" style="margin-bottom: 0.25rem;">
+          <strong>{{ property.first }}:</strong> {{ property.last }}
+        </div>
+      {% endunless %}
+    {% endfor %}
+  </div>
+{% endif %}

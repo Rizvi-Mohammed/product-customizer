@@ -9,30 +9,27 @@ const METAFIELD_NAMESPACE = "productCustomizer";
 
 const METAFIELD_DEFINITIONS = [
   {
-    key: "is_customization_enabled",
-    name: "Customization enabled",
-    description: "Controls whether the product image customizer widget shows.",
-    type: "boolean",
-  },
-  {
-    key: "accessories",
-    name: "Accessories",
-    description: "Accessory products available for this customizable product.",
-    type: "list.product_reference",
-  },
-  {
-    key: "canvas_image",
-    name: "Canvas Image",
-    description: "Image used for canvas customization (PNG with transparency).",
-    type: "file_reference",
-  },
-  {
-    key: "accessory_positions",
-    name: "Accessory Positions",
-    description: "JSON object storing positions of accessories on the canvas.",
-    type: "json",
+    key: "image_customization",
+    name: "Image customization ruleset",
+    description: "Reference to the PIC ruleset metaobject containing all customization data (accessories, categories, image mappings).",
+    type: "metaobject_reference",
+    validations: [
+      {
+        name: "metaobject_definition_id",
+        value: JSON.stringify("pic_ruleset"),
+      },
+    ],
   },
 ];
+
+const METAOBJECT_DEFINITION_QUERY = `#graphql
+  query GetMetaobjectDefinition($type: String!) {
+    metaobjectDefinitionByType(type: $type) {
+      id
+      type
+    }
+  }
+`;
 
 const METAFIELD_DEFINITION_MUTATION = `#graphql
   mutation MetafieldDefinitionCreate($definition: MetafieldDefinitionInput!) {
@@ -52,8 +49,33 @@ const METAFIELD_DEFINITION_MUTATION = `#graphql
 `;
 
 export async function ensureProductCustomizerMetafields(admin: AdminApi) {
+  // First, get the pic_ruleset metaobject definition ID
+  let picRulesetDefinitionId: string | null = null;
+  try {
+    const moResponse = await admin.graphql(METAOBJECT_DEFINITION_QUERY, {
+      variables: { type: "pic_ruleset" },
+    });
+    const moPayload = await moResponse.json();
+    picRulesetDefinitionId = moPayload?.data?.metaobjectDefinitionByType?.id;
+
+    if (!picRulesetDefinitionId) {
+      console.error("❌ pic_ruleset metaobject definition not found. Create it first!");
+      return;
+    }
+    console.log("✅ Found pic_ruleset definition:", picRulesetDefinitionId);
+  } catch (error) {
+    console.error("Error fetching pic_ruleset definition:", error);
+    return;
+  }
+
   for (const definition of METAFIELD_DEFINITIONS) {
     try {
+      // Replace the validation value with the actual metaobject definition ID
+      const validations = definition.validations?.map(v => ({
+        ...v,
+        value: v.name === "metaobject_definition_id" ? picRulesetDefinitionId : v.value,
+      })) || [];
+
       const response = await admin.graphql(METAFIELD_DEFINITION_MUTATION, {
         variables: {
           definition: {
@@ -63,6 +85,7 @@ export async function ensureProductCustomizerMetafields(admin: AdminApi) {
             description: definition.description,
             ownerType: "PRODUCT",
             type: definition.type,
+            validations,
             access: {
               storefront: "PUBLIC_READ",
             },

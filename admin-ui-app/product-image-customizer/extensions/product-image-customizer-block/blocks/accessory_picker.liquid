@@ -1,28 +1,41 @@
 {% comment %}
 Accessory Picker Block
-- Reads product metafields (namespace productCustomizer) for:
-  - accessories: list.product_reference
-  - variant_accessory_images: json map baseVariantId -> accessoryProductId -> { fileUrl, fileId }
-- Renders accessory tiles and wires up JS to swap main image when an accessory is clicked for the current variant.
+- Reads ONLY from metaobject referenced in product.metafields.productCustomizer.image_customization
+- The metaobject contains: accessories, accessory_categories, color_map, variant_map
 {% endcomment %}
 
 {% liquid
-  assign accessories_meta = product.metafields.productCustomizer.accessories
-  assign color_map_meta = product.metafields.productCustomizer.color_combination_images
   assign metaobject_ref = product.metafields.productCustomizer.image_customization
+  
+  assign accessories_label = 'product_customizer.accessories_label' | t
+  if accessories_label contains 'translation missing'
+    assign accessories_label = 'Accessories'
+  endif
+
+  assign choose_accessories_label = 'product_customizer.choose_accessories' | t
+  if choose_accessories_label contains 'translation missing'
+    assign choose_accessories_label = 'Choose accessories'
+  endif
+
+  assign variant_label = 'product_customizer.variant_label' | t
+  if variant_label contains 'translation missing'
+    assign variant_label = 'Choose variant'
+  endif
 %}
 
-{% if accessories_meta == blank %}
-  <div class="accessory-picker accessory-picker--empty">No accessories configured.</div>
+{% if metaobject_ref == blank or metaobject_ref.value == blank %}
+  <div class="accessory-picker accessory-picker--empty">No customization ruleset configured for this product.</div>
 {% else %}
-  {% assign accessories = accessories_meta.value %}
-  {% if metaobject_ref and metaobject_ref.value != blank %}
-    {% assign ic = metaobject_ref.value %}
-    {% assign color_map_source = ic.color_map.value | default: ic.color_map %}
-  {% else %}
-    {% assign color_map_source = color_map_meta.value %}
-  {% endif %}
-  {% assign color_map_json = color_map_source | default: '{}' | replace: '=>', ':' | replace: '\"', '"' | replace: '\"', '"' %}
+  {% assign ic = metaobject_ref.value %}
+  {% assign ruleset_handle = ic.handle | default: ic.id %}
+  {% assign accessories = ic.accessories.value | default: ic.accessories %}
+  {% assign color_map_source = ic.color_map.value | default: ic.color_map %}
+  {% assign variant_map_source = ic.variant_map.value | default: ic.variant_map %}
+  {% assign category_map_source = ic.accessory_categories.value | default: ic.accessory_categories %}
+  
+  {% assign color_map_json = color_map_source | default: '{}' | json %}
+  {% assign variant_map_json = variant_map_source | default: '{}' | json %}
+  {% assign category_map_json = category_map_source | default: '{}' | json %}
 
   {{ 'accessory-picker.css' | asset_url | stylesheet_tag }}
   <script src="{{ 'accessory-picker.js' | asset_url }}" defer></script>
@@ -31,48 +44,147 @@ Accessory Picker Block
     class="accessory-picker"
     data-accessory-picker
     data-color-map="script"
+    data-variant-map="script"
+    data-category-map="script"
     data-product-id="{{ product.id }}"
+    data-ruleset-handle="{{ ruleset_handle }}"
+    data-bundle-product-handle="{{ block.settings.bundle_product_handle }}"
   >
     <script type="application/json" data-color-map-script>{{ color_map_json }}</script>
+    <script type="application/json" data-variant-map-script>{{ variant_map_json }}</script>
+    <script type="application/json" data-category-map-script>{{ category_map_json }}</script>
+    <script type="application/json" data-base-variants>
+      [
+        {% for variant in product.variants %}
+          {
+            "id": "{{ variant.id }}",
+            "title": {{ variant.title | json }},
+            "price": {{ variant.price | default: 0 | json }},
+            "available": {{ variant.available | default: false | json }},
+            "inventory_quantity": {{ variant.inventory_quantity | default: 0 | json }}
+          }{% unless forloop.last %},{% endunless %}
+        {% endfor %}
+      ]
+    </script>
+
+    <div class="accessory-picker__shell">
       <div class="accessory-picker__header">
-        <h3 class="accessory-picker__title">{{ 'product_customizer.accessories_label' | t }}</h3>
+        <div class="accessory-picker__eyebrow">{{ choose_accessories_label }}</div>
+        <div class="accessory-picker__title-row">
+          <h3 class="accessory-picker__title">{{ accessories_label }}</h3>
+          <span class="accessory-picker__badge">{{ 'product_customizer.curated_label' | t | default: 'Curated for this item' }}</span>
+        </div>
       </div>
 
-      <div class="accessory-picker__list" role="list">
+      <div class="accessory-picker__summary" data-accessory-summary hidden></div>
+      <div class="accessory-picker__totals" data-accessory-totals hidden>
+        <div class="accessory-picker__total-line">
+          <span>{{ 'product_customizer.add_to_cart' | t | default: 'Add to cart' }}</span>
+          <span class="accessory-picker__total-value" data-total-price></span>
+        </div>
+        <div class="accessory-picker__stock" data-stock-warning hidden></div>
+      </div>
+      <button type="button" class="accessory-picker__cta" data-accessory-submit id="add-bundle-button" style="display: none;">
+        {{ 'product_customizer.add_to_cart' | t | default: 'Add with accessories' }}
+      </button>
+
+      <div
+        class="accessory-picker__categories"
+        data-category-dropdowns
+        data-category-none-label="{{ 'product_customizer.category_none_option' | t | escape }}"
+      ></div>
+
+      <div class="accessory-picker__list" role="list" data-legacy-list hidden aria-hidden="true" style="display:none;">
         {% for accessory in accessories %}
-          <button
-            type="button"
-            class="accessory-picker__item"
-            data-accessory-gid="{{ accessory.admin_graphql_api_id | default: accessory.id }}"
-            data-accessory-id="{{ accessory.id }}"
-            data-accessory-variant-id="{{ accessory.selected_or_first_available_variant.id | default: accessory.variants.first.id }}"
-            role="listitem"
-          >
-            <div class="accessory-picker__thumb">
-              {% if accessory.featured_image %}
-                <img
-                  src="{{ accessory.featured_image | image_url: width: 320, height: 320, crop: 'center' }}"
-                  alt="{{ accessory.title | escape }}"
-                  width="320"
-                  height="320"
-                >
-              {% endif %}
-            </div>
-          <div class="accessory-picker__content">
-            <div class="accessory-picker__name">{{ accessory.title }}</div>
-            <div class="accessory-picker__price">{{ accessory.price | money }}</div>
+          {% assign first_variant = accessory.selected_or_first_available_variant | default: accessory.variants.first %}
+          <div class="accessory-picker__item-wrapper" role="listitem" data-accessory-card="{{ accessory.id }}">
+            <button
+              type="button"
+              class="accessory-picker__item"
+              data-accessory-gid="{{ accessory.admin_graphql_api_id | default: accessory.id }}"
+              data-accessory-id="{{ accessory.id }}"
+              data-accessory-variant-id="{{ first_variant.id }}"
+              data-accessory-price="{{ first_variant.price | money }}"
+              data-accessory-image="{{ accessory.featured_image | image_url: width: 200, height: 200, crop: 'center' }}"
+              data-selected-accessory-variant-id="{{ first_variant.id }}"
+            >
+              <div class="accessory-picker__thumb">
+                {% if accessory.featured_image %}
+                  <img
+                    src="{{ accessory.featured_image | image_url: width: 320, height: 320, crop: 'center' }}"
+                    alt="{{ accessory.title | escape }}"
+                    width="320"
+                    height="320"
+                  >
+                {% endif %}
+              </div>
+              <div class="accessory-picker__content">
+                <div class="accessory-picker__name">{{ accessory.title }}</div>
+                <div class="accessory-picker__price">{{ accessory.price | money }}</div>
+              </div>
+            </button>
+
+            {% if accessory.variants.size > 1 %}
+              <div class="accessory-picker__variant">
+                <label class="accessory-picker__variant-label">{{ variant_label }}</label>
+                <div class="accessory-picker__variant-field">
+                  <select
+                    class="accessory-picker__variant-select"
+                    data-accessory-variant-select
+                    data-accessory-id="{{ accessory.id }}"
+                  >
+                    {% for variant in accessory.variants %}
+                      <option value="{{ variant.id }}" {% if variant.id == first_variant.id %}selected{% endif %}>
+                        {{ variant.title }}
+                      </option>
+                    {% endfor %}
+                  </select>
+                </div>
+              </div>
+            {% endif %}
+
+            {% capture variants_payload %}
+              [
+              {% for variant in accessory.variants %}
+                {
+                  "id": "{{ variant.id }}",
+                  "title": {{ variant.title | json }},
+                  "price": {{ variant.price | default: 0 | json }},
+                  "available": {{ variant.available | default: false | json }},
+                  "inventory_quantity": {{ variant.inventory_quantity | default: 0 | json }}
+                }{% unless forloop.last %},{% endunless %}
+              {% endfor %}
+              ]
+            {% endcapture %}
+            <script
+              type="application/json"
+              data-accessory-variants
+              data-accessory-id="{{ accessory.id }}"
+            >
+              {{ variants_payload | strip }}
+            </script>
           </div>
-        </button>
-      {% endfor %}
+        {% endfor %}
+      </div>
     </div>
   </div>
 {% endif %}
+
+{%- comment -%} Load bundle cart display script globally {%- endcomment -%}
+<script src="{{ 'bundle-cart-display.js' | asset_url }}" defer></script>
 
 {% schema %}
 {
   "name": "Accessory picker",
   "target": "section",
   "templates": ["product"],
-  "settings": []
+  "settings": [
+    {
+      "type": "text",
+      "id": "bundle_product_handle",
+      "label": "Bundle Product Handle",
+      "info": "Enter the handle of your 'Create Your Bundle' product (e.g., 'create-your-bundle'). This product will be added to cart with the base product and accessories as bundled items."
+    }
+  ]
 }
 {% endschema %}

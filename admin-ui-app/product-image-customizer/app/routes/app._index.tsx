@@ -1,25 +1,26 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
 import {
   Page,
-  Layout,
   Text,
   Card,
   Button,
   BlockStack,
   Box,
-  List,
   InlineStack,
   Select,
-  ChoiceList,
   Banner,
   Thumbnail,
   Divider,
   Tag,
+  Popover,
+  OptionList,
+  TextField,
+  Scrollable,
 } from "@shopify/polaris";
-import { TitleBar } from "@shopify/app-bridge-react";
+import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { SimpleImagePicker } from "../components/SimpleImagePicker";
 
@@ -36,7 +37,6 @@ type ProductNode = {
   featuredImage?: { url: string } | null;
   options?: { name: string; values: string[] }[];
   variants?: { edges: { node: VariantNode }[] };
-  metafields?: { edges: { node: { key: string; value: string; type?: string } }[] };
   accessories?: ProductNode[];
 };
 
@@ -44,6 +44,20 @@ type ColorGroup = {
   key: string;
   label: string;
   variants: VariantNode[];
+};
+
+type AccessoryCategoryMap = Record<string, string>;
+type CategoryVariantOption = { variantId: string; label: string; accessoryId: string };
+type RuleCategory = { id: string; label: string; productIds: string[] };
+type Ruleset = {
+  id: string;
+  handle: string;
+  name: string;
+  baseProducts: string[];
+  accessories: string[];
+  categories: RuleCategory[];
+  colorMapByBase: Record<string, ColorImageMap>;
+  variantMapByBase: Record<string, VariantImageMap>;
 };
 
 type ColorImageMap = Record<
@@ -54,6 +68,10 @@ type ColorImageMap = Record<
       fileUrl: string;
       fileId?: string;
       accessoryProductId?: string;
+      variantId?: string;
+      combinationKey?: string;
+      accessoryIds?: string[];
+      variantIds?: string[];
     }
   >
 >; // baseColorKey -> accessoryProductId
@@ -67,6 +85,7 @@ type VariantImageMap = Record<
       fileId?: string;
       baseColor?: string;
       accessoryProductId?: string;
+      variantId?: string;
     }
   >
 >; // baseVariantId -> accessoryProductId -> payload
@@ -75,6 +94,20 @@ const toNumericId = (id?: string | null) => {
   if (!id) return id;
   return id.includes("/") ? id.split("/").pop() || id : id;
 };
+
+const buildCombinationKey = (ids: Array<string | null | undefined>) =>
+  ids
+    .map((id) => toNumericId(id || "") || "")
+    .filter(Boolean)
+    .sort()
+    .join("+");
+
+const slugify = (value: string) =>
+  (value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
 
 const normalizeColor = (value?: string | null) =>
   (value || "default").trim().toLowerCase();
@@ -104,17 +137,6 @@ const groupVariantsByColor = (product?: ProductNode | null): ColorGroup[] => {
   return Object.values(groups);
 };
 
-const parseMetafield = (product: ProductNode, key: string) => {
-  const meta = product.metafields?.edges?.find((m: any) => m.node.key === key)?.node?.value;
-  if (!meta) return null;
-  try {
-    return JSON.parse(meta);
-  } catch (e) {
-    console.warn("Failed to parse metafield", key, e);
-    return null;
-  }
-};
-
 const STAGED_UPLOAD_MUTATION = `#graphql
 mutation StagedUploads($input: [StagedUploadInput!]!) {
   stagedUploadsCreate(input: $input) {
@@ -130,34 +152,6 @@ mutation StagedUploads($input: [StagedUploadInput!]!) {
       field
       message
     }
-  }
-}`;
-
-const CREATE_PRODUCT_METAFIELD_DEFINITION = `#graphql
-mutation CreateProductMetafieldDefinition($definition: MetafieldDefinitionInput!) {
-  metafieldDefinitionCreate(definition: $definition) {
-    createdDefinition {
-      id
-      name
-      namespace
-      key
-      access {
-        admin
-        storefront
-      }
-    }
-    userErrors { field message }
-  }
-}`;
-
-const UPDATE_PRODUCT_METAFIELD_DEFINITION = `#graphql
-mutation UpdateProductMetafieldDefinition($id: ID!, $definition: MetafieldDefinitionUpdateInput!) {
-  metafieldDefinitionUpdate(id: $id, definition: $definition) {
-    updatedDefinition {
-      id
-      access { admin storefront }
-    }
-    userErrors { field message }
   }
 }`;
 
@@ -183,46 +177,56 @@ mutation CreateFiles($files: [FileCreateInput!]!) {
   }
 }`;
 
-const METAOBJECT_UPSERT_MUTATION = `#graphql
-mutation UpsertImageCustomization($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
-  metaobjectUpsert(handle: $handle, metaobject: $metaobject) {
-    metaobject {
-      id
-      handle
-      type
+const CREATE_RULESET_DEFINITION = `#graphql
+mutation CreateRulesetDefinition {
+  metaobjectDefinitionCreate(
+    definition: {
+      name: "PIC Ruleset"
+      type: "pic_ruleset"
+      description: "Product Image Customizer ruleset"
+      fieldDefinitions: [
+        { name: "Name", key: "name", type: "single_line_text_field", required: true }
+        { name: "Base products", key: "base_products", type: "json" }
+        { name: "Accessories", key: "accessories", type: "list.product_reference" }
+        { name: "Accessory categories", key: "accessory_categories", type: "json" }
+        { name: "Color map", key: "color_map", type: "json" }
+        { name: "Variant map", key: "variant_map", type: "json" }
+      ]
+      displayNameKey: "name"
     }
-    userErrors {
-      field
-      message
+  ) {
+    metaobjectDefinition { id type name }
+    userErrors { field message }
+  }
+}`;
+
+const RULESET_LIST_QUERY = `#graphql
+query Rulesets {
+  metaobjects(type: "pic_ruleset", first: 50) {
+    edges {
+      node {
+        id
+        handle
+        type
+        fields { key value }
+      }
     }
   }
 }`;
 
-const CREATE_IMAGE_CUSTOMIZATION_DEFINITION = `#graphql
-mutation CreateImageCustomizationDefinition {
-  metaobjectDefinitionCreate(
-    definition: {
-      name: "Image customization"
-      type: "image_customization"
-      description: "Stores product image customization mappings"
-      fieldDefinitions: [
-        { name: "Product ID", key: "product_id", type: "single_line_text_field", required: true }
-        { name: "Accessories", key: "accessories", type: "json" }
-        { name: "Color map", key: "color_map", type: "json" }
-        { name: "Variant map", key: "variant_map", type: "json" }
-      ]
-      displayNameKey: "product_id"
-    }
-  ) {
-    metaobjectDefinition {
-      id
-      type
-      name
-    }
-    userErrors {
-      field
-      message
-    }
+const RULESET_UPSERT_MUTATION = `#graphql
+mutation UpsertRuleset($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
+  metaobjectUpsert(handle: $handle, metaobject: $metaobject) {
+    metaobject { id handle }
+    userErrors { field message }
+  }
+}`;
+
+const RULESET_DELETE_MUTATION = `#graphql
+mutation DeleteRuleset($id: ID!) {
+  metaobjectDelete(id: $id) {
+    deletedId
+    userErrors { field message }
   }
 }`;
 
@@ -230,52 +234,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
 
   try {
-    // Ensure metafield definitions exist and are storefront-accessible
-    const metafieldDefinitions: Array<{ name: string; namespace: string; key: string; type: string }> = [
-      { name: "Accessories", namespace: "productCustomizer", key: "accessories", type: "list.product_reference" },
-      { name: "Color Combination Images", namespace: "productCustomizer", key: "color_combination_images", type: "json" },
-      { name: "Variant Accessory Images", namespace: "productCustomizer", key: "variant_accessory_images", type: "json" },
-      { name: "Image Customization Enabled", namespace: "productCustomizer", key: "is_image_customization_enabled", type: "boolean" },
-      { name: "Image Customization Metaobject", namespace: "productCustomizer", key: "image_customization", type: "metaobject_reference" },
-    ];
-
-    for (const def of metafieldDefinitions) {
-      try {
-        const createResp = await admin.graphql(CREATE_PRODUCT_METAFIELD_DEFINITION, {
-          variables: {
-            definition: {
-              name: def.name,
-              namespace: def.namespace,
-              key: def.key,
-              type: def.type,
-              ownerType: "PRODUCT",
-              access: { admin: true, storefront: true },
-            },
-          },
-        });
-        const createJson = await createResp.json();
-        const errors = createJson?.data?.metafieldDefinitionCreate?.userErrors || createJson?.errors;
-        if (errors?.length) {
-          const alreadyExists = errors.some((e: any) => (e?.message || "").toLowerCase().includes("already exists"));
-          if (!alreadyExists) {
-            console.warn("Metafield definition create errors", def.key, errors);
-          }
-        }
-      } catch (e) {
-        console.warn("Metafield definition create failed", def.key, e);
-      }
-    }
-
-    // Ensure metaobject definition exists (idempotent: ignore duplicate errors)
+    // Ensure ruleset metaobject definition exists (ignore duplicate errors quietly)
     try {
-      const ensure = await admin.graphql(CREATE_IMAGE_CUSTOMIZATION_DEFINITION);
+      const ensure = await admin.graphql(CREATE_RULESET_DEFINITION);
       const ensureJson = await ensure.json();
-      const ensureErrors = ensureJson?.data?.metaobjectDefinitionCreate?.userErrors || ensureJson?.errors;
-      if (ensureErrors?.length && !String(ensureErrors[0]?.message || "").toLowerCase().includes("already exists")) {
-        console.warn("Metaobject definition create errors", ensureErrors);
+      const ensureErrors =
+        ensureJson?.data?.metaobjectDefinitionCreate?.userErrors || ensureJson?.errors;
+      if (Array.isArray(ensureErrors)) {
+        const duplicate = ensureErrors.some(
+          (err: any) => (err?.message || "").toLowerCase().includes("already been taken"),
+        );
+        if (ensureErrors.length && !duplicate) {
+          console.error("❌ Ruleset definition create errors:", JSON.stringify(ensureErrors, null, 2));
+        } else if (duplicate) {
+          console.log("✅ Ruleset definition already exists");
+        }
+      } else {
+        console.log("✅ Ruleset definition created successfully");
       }
     } catch (e) {
-      console.warn("Metaobject definition create failed", e);
+      console.error("❌ Error creating ruleset definition:", e);
     }
 
     const response = await admin.graphql(`#graphql
@@ -297,9 +275,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
                   }
                 }
               }
-              metafields(namespace: "productCustomizer", first: 30) {
-                edges { node { key value type } }
-              }
             }
           }
         }
@@ -315,21 +290,46 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
     const products: ProductNode[] = data.data.products.edges.map((edge: any) => edge.node);
 
-    // Attach accessory product objects for easier lookups
-    products.forEach((product) => {
-      const accessoriesRaw = parseMetafield(product, "accessories") as string[] | null;
-      if (accessoriesRaw?.length) {
-        product.accessories = accessoriesRaw
-          .map((id) => products.find((p) => p.id === id))
-          .filter(Boolean) as ProductNode[];
-      }
+    const rulesetResp = await admin.graphql(RULESET_LIST_QUERY);
+    const rulesetJson = (await rulesetResp.json()) as any;
+    const rulesets: Ruleset[] = (rulesetJson?.data?.metaobjects?.edges || []).map((edge: any) => {
+      const fields = edge.node.fields || [];
+      const getField = (key: string) => fields.find((f: any) => f.key === key)?.value;
+      const parseJson = (val: string | null) => {
+        if (!val) return {};
+        try {
+          return JSON.parse(val);
+        } catch {
+          return {};
+        }
+      };
+      const parseJsonArray = (val: string | null) => {
+        if (!val) return [];
+        try {
+          const parsed = JSON.parse(val);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      };
+      return {
+        id: edge.node.id,
+        handle: edge.node.handle,
+        name: getField("name") || edge.node.handle,
+        baseProducts: parseJsonArray(getField("base_products")),
+        accessories: parseJsonArray(getField("accessories")),
+        categories: (parseJson(getField("accessory_categories")) || []) as RuleCategory[],
+        colorMapByBase: parseJson(getField("color_map")) || {},
+        variantMapByBase: parseJson(getField("variant_map")) || {},
+      };
     });
 
-    return json({ products, error: null });
+    return json({ products, rulesets, error: null });
   } catch (error) {
     console.error("Loader error:", error);
     return json({
       products: [],
+      rulesets: [],
       error: error instanceof Error ? error.message : String(error),
     });
   }
@@ -340,10 +340,145 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
   const actionType = formData.get("action");
 
+  if (actionType === "create_ruleset") {
+    const name = (formData.get("name") as string) || "Ruleset";
+    const handleValue = slugify(name) || `ruleset-${Date.now()}`;
+    const upsertResp = await admin.graphql(RULESET_UPSERT_MUTATION, {
+      variables: {
+        handle: { type: "pic_ruleset", handle: handleValue },
+        metaobject: {
+          handle: handleValue,
+          fields: [
+            { key: "name", value: name },
+            { key: "base_products", value: JSON.stringify([]) },
+            { key: "accessories", value: JSON.stringify([]) },
+            { key: "accessory_categories", value: JSON.stringify([]) },
+            { key: "color_map", value: JSON.stringify({}) },
+            { key: "variant_map", value: JSON.stringify({}) },
+          ],
+        },
+      },
+    });
+    const jsonResp = await upsertResp.json();
+    const mo = jsonResp?.data?.metaobjectUpsert?.metaobject;
+    const errors = jsonResp?.data?.metaobjectUpsert?.userErrors || jsonResp?.errors;
+
+    if (errors && errors.length > 0) {
+      console.error("❌ Create ruleset errors:", JSON.stringify(errors, null, 2));
+      return json({ error: "Create failed", details: errors }, { status: 400 });
+    }
+
+    if (!mo?.id) {
+      console.error("❌ No metaobject returned:", JSON.stringify(jsonResp, null, 2));
+      return json({ error: "Create failed - no ID returned", details: jsonResp }, { status: 400 });
+    }
+
+    console.log("✅ Ruleset created:", mo.id);
+    return json({ ok: true, rulesetId: mo.id, handle: mo.handle, name, lastAction: "create_ruleset" });
+  }
+
+  if (actionType === "delete_ruleset") {
+    const rulesetId = formData.get("rulesetId") as string;
+    if (!rulesetId) return json({ error: "Missing rulesetId" }, { status: 400 });
+    const delResp = await admin.graphql(RULESET_DELETE_MUTATION, { variables: { id: rulesetId } });
+    const delJson = await delResp.json();
+    const err = delJson?.data?.metaobjectDelete?.userErrors || delJson?.errors;
+    if (err?.length) return json({ error: "Delete failed", details: err }, { status: 400 });
+    return json({ ok: true, deletedId: rulesetId });
+  }
+
+  if (actionType === "save_ruleset") {
+    const explicitHandle = (formData.get("handle") as string) || "";
+    const name = (formData.get("name") as string) || "Ruleset";
+    const baseProducts = JSON.parse(formData.get("baseProducts") as string) as string[];
+    const categories = JSON.parse(formData.get("categories") as string) as RuleCategory[];
+    const colorMap = JSON.parse((formData.get("colorMap") as string) || "{}");
+    const variantMap = JSON.parse((formData.get("variantMap") as string) || "{}");
+    const handleValue = explicitHandle || slugify(name) || `ruleset-${Date.now()}`;
+
+    // Extract all unique accessory product IDs from categories
+    const allAccessories = Array.from(
+      new Set(categories.flatMap((cat) => cat.productIds || []))
+    );
+
+    const metaobjectInput: any = {
+      handle: handleValue,
+      fields: [
+        { key: "name", value: name },
+        { key: "base_products", value: JSON.stringify(baseProducts || []) },
+        { key: "accessories", value: JSON.stringify(allAccessories) },
+        { key: "accessory_categories", value: JSON.stringify(categories || []) },
+        { key: "color_map", value: JSON.stringify(colorMap || {}) },
+        { key: "variant_map", value: JSON.stringify(variantMap || {}) },
+      ],
+    };
+    const upsertResp = await admin.graphql(RULESET_UPSERT_MUTATION, {
+      variables: {
+        handle: { type: "pic_ruleset", handle: handleValue },
+        metaobject: metaobjectInput,
+      },
+    });
+    const upsertJson = await upsertResp.json();
+    const mo = upsertJson?.data?.metaobjectUpsert?.metaobject;
+    if (!mo?.id) return json({ error: "Save failed", details: upsertJson }, { status: 400 });
+
+    // Link all base products to this ruleset via metafield
+    if (baseProducts.length > 0) {
+      const metafields = baseProducts.map((productId) => ({
+        ownerId: productId,
+        namespace: "productCustomizer",
+        key: "image_customization",
+        value: mo.id,
+        type: "metaobject_reference",
+      }));
+
+      console.log("🔗 Linking products to ruleset:", baseProducts.length, "products");
+      const linkResp = await admin.graphql(`#graphql
+        mutation updateMetafields($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields { id key namespace }
+            userErrors { field message }
+          }
+        }
+      `, {
+        variables: { metafields },
+      });
+
+      const linkJson = await linkResp.json();
+      const linkErrors = linkJson?.data?.metafieldsSet?.userErrors;
+      if (linkErrors && linkErrors.length > 0) {
+        console.error("❌ Failed to link products:", JSON.stringify(linkErrors, null, 2));
+      } else {
+        console.log("✅ Products linked successfully:", linkJson?.data?.metafieldsSet?.metafields?.length || 0);
+      }
+    }
+
+    return json({
+      ok: true,
+      rulesetId: mo.id,
+      handle: mo.handle,
+      name,
+      baseProducts,
+      categories,
+      lastAction: "save_ruleset",
+    });
+  }
+
   if (actionType === "upload_image") {
     const productId = formData.get("productId") as string;
     const baseColorKey = formData.get("baseColorKey") as string;
     const accessoryId = formData.get("accessoryId") as string;
+    const accessoryVariantId = formData.get("accessoryVariantId") as string | null;
+    const combinationKey = formData.get("combinationKey") as string | null;
+    const combinationMetaRaw = formData.get("combinationMeta") as string | null;
+    let combinationMeta = null;
+    if (combinationMetaRaw) {
+      try {
+        combinationMeta = JSON.parse(combinationMetaRaw);
+      } catch (e) {
+        combinationMeta = null;
+      }
+    }
     const file = formData.get("file");
 
     if (!productId || !baseColorKey || !accessoryId) {
@@ -357,11 +492,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const fileBlob = file as Blob;
     const filename = (file as any).name || "upload.jpg";
     const mimeType = fileBlob.type || "image/jpeg";
-    // Shopify expects UnsignedInt64 encoded as string.
-    const fileSize =
-      typeof (fileBlob as any).size === "number"
-        ? (fileBlob as any).size.toString()
-        : undefined;
+    const fileSize = typeof (fileBlob as any).size === "number" ? (fileBlob as any).size : undefined;
 
     const stagedResp = await admin.graphql(STAGED_UPLOAD_MUTATION, {
       variables: {
@@ -371,7 +502,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             mimeType,
             resource: "FILE",
             httpMethod: "POST",
-            fileSize,
+            fileSize: typeof fileSize === "number" ? fileSize.toString() : undefined,
           },
         ],
       },
@@ -427,193 +558,120 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ok: true,
       baseColorKey,
       accessoryId,
+      accessoryVariantId,
+      combinationKey,
+      combinationMeta,
       fileId: created.id,
       fileUrl,
     });
   }
 
-  if (actionType === "enable_color_mode") {
-    const productId = formData.get("productId") as string;
-
-    await admin.graphql(`#graphql
-      mutation updateMetafields($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          userErrors { field message }
-        }
-      }
-    `, {
-      variables: {
-        metafields: [
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "is_image_customization_enabled",
-            value: "true",
-            type: "boolean",
-          },
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "accessories",
-            value: JSON.stringify([]),
-            type: "list.product_reference",
-          },
-        ],
-      },
-    });
-
-    return json({ ok: true });
-  }
-
-  if (actionType === "save_accessories") {
-    const productId = formData.get("productId") as string;
-    const accessories = JSON.parse(formData.get("accessories") as string) as string[];
-
-    await admin.graphql(`#graphql
-      mutation updateMetafields($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          userErrors { field message }
-        }
-      }
-    `, {
-      variables: {
-        metafields: [
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "is_image_customization_enabled",
-            value: "true",
-            type: "boolean",
-          },
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "accessories",
-            value: JSON.stringify(accessories),
-            type: "list.product_reference",
-          },
-        ],
-      },
-    });
-
-    return json({ ok: true });
-  }
-
   if (actionType === "save_color_map") {
-    const productId = formData.get("productId") as string;
-    const accessories = JSON.parse(formData.get("accessories") as string) as string[];
+    const rulesetId = formData.get("rulesetId") as string | null;
+    const handle = (formData.get("handle") as string) || "";
     const colorMap = formData.get("colorMap") as string;
     const variantMap = formData.get("variantMap") as string;
 
-    await admin.graphql(`#graphql
-      mutation updateMetafields($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          userErrors { field message }
-        }
-      }
-    `, {
-      variables: {
-        metafields: [
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "is_image_customization_enabled",
-            value: "true",
-            type: "boolean",
-          },
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "accessories",
-            value: JSON.stringify(accessories),
-            type: "list.product_reference",
-          },
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "color_combination_images",
-            value: colorMap,
-            type: "json",
-          },
-          {
-            ownerId: productId,
-            namespace: "productCustomizer",
-            key: "variant_accessory_images",
-            value: variantMap,
-            type: "json",
-          },
-        ],
-      },
-    });
+    if (!rulesetId) return json({ error: "Missing rulesetId" }, { status: 400 });
 
-    // Canonical storage in metaobjects (requires a definition of type image_customization).
     try {
-      const handleValue = `product-${toNumericId(productId) || productId}`;
-      const upsertResp = await admin.graphql(METAOBJECT_UPSERT_MUTATION, {
+      const handleValue = handle || slugify(rulesetId);
+      const upsertResp = await admin.graphql(RULESET_UPSERT_MUTATION, {
         variables: {
-          handle: { type: "image_customization", handle: handleValue },
+          handle: { type: "pic_ruleset", handle: handleValue },
           metaobject: {
             handle: handleValue,
             fields: [
-              { key: "product_id", value: productId },
-              { key: "accessories", value: JSON.stringify(accessories) },
-              { key: "color_map", value: colorMap },
-              { key: "variant_map", value: variantMap },
+              { key: "color_map", value: colorMap || "{}" },
+              { key: "variant_map", value: variantMap || "{}" },
             ],
           },
         },
       });
-      const upsertJson = (await upsertResp.json()) as any;
-      const metaobjectId = upsertJson?.data?.metaobjectUpsert?.metaobject?.id;
-      if (metaobjectId) {
-        // Link the metaobject to the product via a reference metafield (storefront-readable)
-        await admin.graphql(`#graphql
-          mutation LinkImageCustomization($metafields: [MetafieldsSetInput!]!) {
-            metafieldsSet(metafields: $metafields) {
-              userErrors { field message }
-            }
-          }
-        `, {
-          variables: {
-            metafields: [
-              {
-                ownerId: productId,
-                namespace: "productCustomizer",
-                key: "image_customization",
-                type: "metaobject_reference",
-                value: metaobjectId,
-              },
-            ],
-          },
-        });
-      } else {
-        console.error("Metaobject upsert missing id", upsertJson);
-      }
+      const upsertJson = await upsertResp.json();
+      const mo = upsertJson?.data?.metaobjectUpsert?.metaobject;
+      if (!mo?.id) return json({ error: "Save failed", details: upsertJson }, { status: 400 });
+      return json({
+        ok: true,
+        rulesetId: mo.id,
+        handle: mo.handle,
+        colorMapByBase: colorMap ? JSON.parse(colorMap) : {},
+        variantMapByBase: variantMap ? JSON.parse(variantMap) : {},
+        lastAction: "save_color_map",
+      });
     } catch (e) {
-      console.error("Metaobject upsert failed", e);
+      console.error("Ruleset color map save failed", e);
+      return json({ error: "Ruleset save failed" }, { status: 400 });
+    }
+  }
+
+  if (actionType === "link_product_to_ruleset") {
+    const productId = formData.get("productId") as string;
+    const rulesetId = formData.get("rulesetId") as string;
+
+    if (!productId || !rulesetId) {
+      return json({ error: "Missing productId or rulesetId" }, { status: 400 });
     }
 
-    return json({ ok: true });
+    await admin.graphql(`#graphql
+      mutation updateMetafields($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          userErrors { field message }
+        }
+      }
+    `, {
+      variables: {
+        metafields: [
+          {
+            ownerId: productId,
+            namespace: "productCustomizer",
+            key: "image_customization",
+            value: rulesetId,
+            type: "metaobject_reference",
+          },
+        ],
+      },
+    });
+
+    return json({ ok: true, productId, rulesetId });
   }
 
   return json({ error: "Unknown action" }, { status: 400 });
 };
 
 export default function Index() {
-  const { products, error } = useLoaderData<typeof loader>();
+  const { products, rulesets, error } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const uploadFetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
 
+  const [rulesetList, setRulesetList] = useState<Ruleset[]>(rulesets || []);
   const initialProductId = products[0]?.id || "";
+  const [selectedRulesetId, setSelectedRulesetId] = useState<string>("");
+  const [selectedRulesetHandle, setSelectedRulesetHandle] = useState<string>("");
+  const [selectedRulesetName, setSelectedRulesetName] = useState<string>("Untitled ruleset");
   const [selectedProductId, setSelectedProductId] = useState<string>(initialProductId);
+  const [selectedBaseProducts, setSelectedBaseProducts] = useState<string[]>([]);
   const [selectedAccessories, setSelectedAccessories] = useState<string[]>([]);
-  const [step, setStep] = useState<"select" | "accessories" | "uploads">("select");
+  const [ruleCategories, setRuleCategories] = useState<RuleCategory[]>([]);
+  const [accessoryCategories, setAccessoryCategories] = useState<AccessoryCategoryMap>({});
+  const [accessoryVariantSelection, setAccessoryVariantSelection] = useState<Record<string, string[]>>({});
+  const [accessorySearch, setAccessorySearch] = useState("");
+  const [step, setStep] = useState<"list" | "configure" | "mappings">("list");
   const [colorImageMap, setColorImageMap] = useState<ColorImageMap>({});
+  const [colorImageMapByBase, setColorImageMapByBase] = useState<Record<string, ColorImageMap>>({});
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [mappingMode, setMappingMode] = useState<"show_all" | "create_specific">("create_specific");
+  const [selectedBaseVariantId, setSelectedBaseVariantId] = useState<string>("");
+  const [selectedMappingAccessories, setSelectedMappingAccessories] = useState<string[]>([]);
+  const [openBaseProductPicker, setOpenBaseProductPicker] = useState(false);
   const uploadInFlight = uploadFetcher.state !== "idle";
+  const uploadError = (uploadFetcher.data as any)?.error;
   const uploadingKey = useMemo(() => {
     const fd = uploadFetcher.formData;
     if (!fd) return null;
-    return `${fd.get("baseColorKey")}-${fd.get("accessoryId")}`;
+    const variantId = fd.get("accessoryVariantId");
+    return `${fd.get("baseColorKey")}-${variantId || fd.get("accessoryId")}`;
   }, [uploadFetcher.formData]);
 
   const selectedProduct = useMemo(
@@ -621,21 +679,103 @@ export default function Index() {
     [products, selectedProductId],
   );
 
-  const enabledProducts = useMemo(
-    () =>
-      products.filter((p: ProductNode) =>
-        p.metafields?.edges?.some(
-          (m: any) => m.node.key === "is_image_customization_enabled" && m.node.value === "true",
-        ),
-      ),
-    [products],
-  );
-
   const baseColorGroups = useMemo(() => groupVariantsByColor(selectedProduct), [selectedProduct]);
 
   const accessoryProducts = useMemo(
     () => products.filter((p: ProductNode) => selectedAccessories.includes(p.id)),
     [products, selectedAccessories],
+  );
+
+  const categoryGroups = useMemo(
+    () => {
+      const groups: Record<string, { label: string; accessoryIds: string[] }> = {};
+      selectedAccessories.forEach((id) => {
+        const rawLabel = accessoryCategories[id] || "";
+        const label = rawLabel.trim() || "Accessories";
+        if (!groups[label]) groups[label] = { label, accessoryIds: [] };
+        groups[label].accessoryIds.push(id);
+      });
+      return Object.values(groups);
+    },
+    [selectedAccessories, accessoryCategories],
+  );
+
+  const categoryVariantOptions = useMemo(
+    () =>
+      categoryGroups
+        .map((group) => {
+          const variants: CategoryVariantOption[] = [];
+          group.accessoryIds.forEach((accId) => {
+            const prod = products.find((p) => p.id === accId);
+            const prodVariants = prod?.variants?.edges?.map((edge) => edge.node) || [];
+            if (prodVariants.length === 0) {
+              variants.push({
+                accessoryId: accId,
+                variantId: accId,
+                label: prod?.title || "Accessory",
+              });
+            } else {
+              prodVariants.forEach((variant) => {
+                variants.push({
+                  accessoryId: accId,
+                  variantId: variant.id,
+                  label: `${prod?.title || "Accessory"} — ${variant.title}`,
+                });
+              });
+            }
+          });
+          return { label: group.label, variants };
+        })
+        .filter((group) => group.variants.length > 0),
+    [categoryGroups, products],
+  );
+
+  const categoryCombinations = useMemo(() => {
+    if (categoryVariantOptions.length < 2) return [];
+    const buckets = categoryVariantOptions.map((group) => group.variants);
+    const combos = buckets.reduce(
+      (acc, variants) =>
+        acc.flatMap((prev) => variants.map((variant) => [...prev, variant])),
+      [[]] as CategoryVariantOption[][],
+    );
+    return combos
+      .map((combo) => {
+        const variantIds = combo.map((c) => c.variantId);
+        const accessoryIds = combo.map((c) => c.accessoryId);
+        const comboKey = buildCombinationKey(variantIds);
+        return {
+          key: comboKey,
+          variantIds,
+          accessoryIds,
+          labels: combo.map((c, idx) => `${categoryVariantOptions[idx]?.label || "Category"}: ${c.label}`),
+        };
+      })
+      .filter((entry) => entry.key);
+  }, [categoryVariantOptions]);
+
+  const resolveAccessoryVariantIds = useCallback(
+    (accessoryId: string) => {
+      const selected = accessoryVariantSelection[accessoryId];
+      if (selected?.length) return selected;
+      const prod = products.find((p) => p.id === accessoryId);
+      const allVariants = prod?.variants?.edges?.map((edge) => edge.node.id) || [];
+      return allVariants.length ? allVariants : [accessoryId];
+    },
+    [accessoryVariantSelection, products],
+  );
+
+  const resolveAccessoryVariantTitle = useCallback(
+    (accessoryId: string, variantId: string) => {
+      const prod = products.find((p) => p.id === accessoryId);
+      const match = prod?.variants?.edges?.find((edge) => edge.node.id === variantId)?.node;
+      return match?.title || "Variant";
+    },
+    [products],
+  );
+
+  const productOptions = useMemo(
+    () => products.map((p: ProductNode) => ({ label: p.title, value: p.id })),
+    [products],
   );
 
   // Keep selection valid if products change.
@@ -651,76 +791,260 @@ export default function Index() {
   }, [products, selectedProductId]);
 
   useEffect(() => {
+    setRulesetList((prev) => {
+      if (!rulesets?.length) return prev;
+      if (!prev.length) return rulesets;
+      // Merge loader data with local state, preserving local maps/categories/base products when loader is stale.
+      return rulesets.map((r) => {
+        const local = prev.find((p) => p.id === r.id);
+        if (!local) return r;
+        return {
+          ...r,
+          baseProducts: local.baseProducts?.length ? local.baseProducts : r.baseProducts,
+          categories: local.categories?.length ? local.categories : r.categories,
+          colorMapByBase:
+            local.colorMapByBase && Object.keys(local.colorMapByBase).length
+              ? local.colorMapByBase
+              : r.colorMapByBase,
+          variantMapByBase:
+            local.variantMapByBase && Object.keys(local.variantMapByBase).length
+              ? local.variantMapByBase
+              : r.variantMapByBase,
+        };
+      });
+    });
+  }, [rulesets]);
+
+  useEffect(() => {
+    if (!selectedRulesetId) return;
+    const rs = rulesetList.find((r) => r.id === selectedRulesetId);
+    if (!rs) return;
+
+    // This effect ONLY loads data, navigation is handled by button click handlers
+    setSelectedRulesetName(rs.name);
+    setSelectedRulesetHandle(rs.handle || "");
+    setSelectedBaseProducts(rs.baseProducts || []);
+    setRuleCategories(rs.categories || []);
+    setColorImageMapByBase((prev) => {
+      const incoming = rs.colorMapByBase || {};
+      if (!Object.keys(incoming).length) return prev;
+      return { ...prev, ...incoming };
+    });
+    if (rs.baseProducts?.length) {
+      setSelectedProductId(rs.baseProducts[0]);
+      setColorImageMap((prev) => {
+        const fromIncoming = rs.colorMapByBase?.[rs.baseProducts[0]];
+        if (fromIncoming && Object.keys(fromIncoming).length) return fromIncoming;
+        return prev;
+      });
+    }
+  }, [selectedRulesetId, rulesetList]);
+
+  useEffect(() => {
+    const unionAccessories = Array.from(
+      new Set(ruleCategories.flatMap((cat) => cat.productIds || [])),
+    );
+    setSelectedAccessories(unionAccessories);
+    const accLabels: AccessoryCategoryMap = {};
+    ruleCategories.forEach((cat) => {
+      (cat.productIds || []).forEach((pid) => {
+        accLabels[pid] = cat.label || "Accessories";
+      });
+    });
+    setAccessoryCategories(accLabels);
+  }, [ruleCategories]);
+
+  useEffect(() => {
     if (!selectedProduct) {
-      setSelectedAccessories([]);
       setColorImageMap({});
       return;
     }
+    setColorImageMap(colorImageMapByBase[selectedProductId] || {});
+  }, [selectedProductId, colorImageMapByBase]);
 
-    const accessoriesMeta = parseMetafield(selectedProduct, "accessories") as string[] | null;
-    const colorMapMeta = parseMetafield(selectedProduct, "color_combination_images") as ColorImageMap | null;
-
-    setSelectedAccessories(accessoriesMeta || []);
-    setColorImageMap(colorMapMeta || {});
+  useEffect(() => {
+    if (!selectedProductId) return;
+    setSelectedBaseProducts((prev) =>
+      prev.includes(selectedProductId) ? prev : [...prev, selectedProductId],
+    );
+  }, [selectedProductId]);
+  useEffect(() => {
+    setAccessorySearch("");
   }, [selectedProductId]);
 
-  const productOptions = products.map((p: ProductNode) => ({ label: p.title, value: p.id }));
-  const accessoryOptions = products
-    .filter((p: ProductNode) => p.id !== selectedProductId)
-    .map((p: ProductNode) => ({ label: p.title, value: p.id }));
+  // Keep accessory-variant selections in sync with accessory choices
+  useEffect(() => {
+    setAccessoryVariantSelection((prev) => {
+      const next: Record<string, string[]> = { ...prev };
+      // Drop removed accessories
+      Object.keys(next).forEach((key) => {
+        if (!selectedAccessories.includes(key)) {
+          delete next[key];
+        }
+      });
+      // Ensure defaults for new accessories
+      selectedAccessories.forEach((id) => {
+        if (!next[id]) {
+          const prod = products.find((p) => p.id === id);
+          const variants = prod?.variants?.edges?.map((edge) => edge.node.id) || [];
+          next[id] = variants.length ? variants : [id];
+        }
+      });
+      return next;
+    });
+  }, [selectedAccessories, products]);
 
-  const handleEnableProduct = () => {
-    if (!selectedProductId) return;
-    const formData = new FormData();
-    formData.append("action", "enable_color_mode");
-    formData.append("productId", selectedProductId);
-    fetcher.submit(formData, { method: "post" });
-    setStep("accessories");
-  };
+  useEffect(() => {
+    const data = fetcher.data as any;
+    const lastAction = data?.lastAction || fetcher.formData?.get("action");
+    if (data?.ok && data.rulesetId) {
+      // Don't set selectedRulesetId if we're doing save_color_map (returning to list)
+      if (lastAction !== "save_color_map") {
+        setSelectedRulesetId(data.rulesetId);
+        setSelectedRulesetHandle(data.handle || "");
+      }
+      if (data.colorMapByBase) {
+        setColorImageMapByBase((prev) => ({ ...prev, ...data.colorMapByBase }));
+        if (selectedProductId && lastAction !== "save_color_map") {
+          const nextMap = data.colorMapByBase[selectedProductId];
+          if (nextMap) {
+            setColorImageMap(nextMap);
+          }
+        }
+      }
+      if (data.handle || data.name) {
+        setRulesetList((prev) => {
+          const exists = prev.find((r) => r.id === data.rulesetId);
+          const nextPayload = {
+            baseProducts: data.baseProducts || selectedBaseProducts,
+            categories: data.categories || ruleCategories,
+            colorMapByBase: data.colorMapByBase || colorImageMapByBase,
+            variantMapByBase: data.variantMapByBase || {},
+          };
+          if (exists) {
+            return prev.map((r) =>
+              r.id === data.rulesetId
+                ? {
+                  ...r,
+                  name: data.name || r.name,
+                  handle: data.handle || r.handle,
+                  ...nextPayload,
+                  variantMapByBase:
+                    nextPayload.variantMapByBase && Object.keys(nextPayload.variantMapByBase).length
+                      ? nextPayload.variantMapByBase
+                      : r.variantMapByBase,
+                }
+                : r,
+            );
+          }
+          return [
+            ...prev,
+            {
+              id: data.rulesetId,
+              handle: data.handle || data.rulesetId,
+              name: data.name || "Ruleset",
+              ...nextPayload,
+            },
+          ];
+        });
+      }
+      if (lastAction === "save_ruleset") {
+        setStep("mappings");
+      } else if (lastAction === "save_color_map") {
+        // Don't navigate - the button handler will do it
+      } else if (lastAction === "create_ruleset") {
+        setStep("configure");
+      }
+    }
+    if (data?.deletedId) {
+      setSelectedRulesetId("");
+      setSelectedRulesetHandle("");
+      setRulesetList((prev) => prev.filter((r) => r.id !== data.deletedId));
+    }
+  }, [fetcher.data]);
 
-  const handleConfigureTile = (productId: string) => {
-    setSelectedProductId(productId);
-    setStep("accessories");
-  };
-
-  const handleSaveAccessories = () => {
-    if (!selectedProductId) return;
-    const formData = new FormData();
-    formData.append("action", "save_accessories");
-    formData.append("productId", selectedProductId);
-    formData.append("accessories", JSON.stringify(selectedAccessories));
-    fetcher.submit(formData, { method: "post" });
-    setStep("uploads");
-  };
-
+  useEffect(() => {
+    setAccessoryCategories((prev) => {
+      const next: AccessoryCategoryMap = { ...prev };
+      Object.keys(next).forEach((key) => {
+        if (!selectedAccessories.includes(key)) {
+          delete next[key];
+        }
+      });
+      selectedAccessories.forEach((id) => {
+        if (!next[id]) {
+          const prod = products.find((p) => p.id === id);
+          next[id] = prod?.title || "Accessories";
+        }
+      });
+      return next;
+    });
+  }, [selectedAccessories, products]);
   useEffect(() => {
     const data = uploadFetcher.data as any;
     if (data?.ok && data.fileUrl) {
       setColorImageMap((prev) => {
         const next = { ...prev } as ColorImageMap;
-        if (!next[data.baseColorKey]) next[data.baseColorKey] = {} as any;
-        next[data.baseColorKey][data.accessoryId] = {
+        const colorKey = data.baseColorKey;
+        if (!colorKey) return prev;
+        if (!next[colorKey]) next[colorKey] = {} as any;
+        const combinationKey = data.combinationKey as string | undefined;
+        const combinationMeta = (data.combinationMeta || {}) as { accessoryIds?: string[]; variantIds?: string[] };
+        const payload = {
           fileUrl: data.fileUrl,
           fileId: data.fileId,
           accessoryProductId: data.accessoryId,
+          variantId: data.accessoryVariantId || data.accessoryId,
+          combinationKey: combinationKey || undefined,
+          accessoryIds: combinationMeta.accessoryIds,
+          variantIds: combinationMeta.variantIds,
         };
+        if (combinationKey) {
+          next[colorKey][combinationKey] = payload;
+        } else {
+          const key = data.accessoryVariantId || data.accessoryId;
+          next[colorKey][key] = payload;
+        }
+        setColorImageMapByBase((prevMaps) => ({
+          ...prevMaps,
+          [selectedProductId]: next,
+        }));
+        // Persist in ruleset list so loader revalidation doesn't wipe freshly uploaded images.
+        if (selectedRulesetId) {
+          setRulesetList((prev) =>
+            prev.map((r) =>
+              r.id === selectedRulesetId
+                ? {
+                  ...r,
+                  colorMapByBase: { ...(r.colorMapByBase || {}), [selectedProductId]: next },
+                }
+                : r,
+            ),
+          );
+        }
         return next;
       });
     }
-  }, [uploadFetcher.data]);
+  }, [uploadFetcher.data, selectedProductId]);
 
   const handleFileSelected = (
     baseColorKey: string,
-    accessoryId: string,
+    accessoryProductId: string,
+    accessoryVariantId: string,
     file: File | null,
+    options?: { combinationKey?: string; accessoryIds?: string[]; variantIds?: string[] },
   ) => {
     if (!selectedProductId) return;
     if (!file) {
       setColorImageMap((prev) => {
         const next = { ...prev } as ColorImageMap;
-        if (next[baseColorKey]?.[accessoryId]) {
+        if (next[baseColorKey]) {
           const copy = { ...next[baseColorKey] } as any;
-          delete copy[accessoryId];
+          if (options?.combinationKey) {
+            delete copy[options.combinationKey];
+          } else {
+            delete copy[accessoryVariantId || accessoryProductId];
+          }
           next[baseColorKey] = copy;
         }
         return next;
@@ -732,7 +1056,20 @@ export default function Index() {
     fd.append("action", "upload_image");
     fd.append("productId", selectedProductId);
     fd.append("baseColorKey", baseColorKey);
-    fd.append("accessoryId", accessoryId);
+    fd.append("accessoryId", accessoryProductId);
+    fd.append("accessoryVariantId", accessoryVariantId);
+    if (options?.combinationKey) {
+      fd.append("combinationKey", options.combinationKey);
+    }
+    if (options?.accessoryIds || options?.variantIds) {
+      fd.append(
+        "combinationMeta",
+        JSON.stringify({
+          accessoryIds: options?.accessoryIds,
+          variantIds: options?.variantIds,
+        }),
+      );
+    }
     fd.append("file", file);
     uploadFetcher.submit(fd, { method: "post", encType: "multipart/form-data" });
   };
@@ -742,9 +1079,13 @@ export default function Index() {
 
     // Expand color-based map to variant-based map so storefront can resolve quickly
     const variantMap: VariantImageMap = {};
+    const colorMapToSave: ColorImageMap = JSON.parse(JSON.stringify(colorImageMap || {}));
+
+    console.log("🔧 handleSaveColorMap called");
+    console.log("baseColorGroups:", baseColorGroups);
+    console.log("colorImageMap:", colorImageMap);
 
     baseColorGroups.forEach((baseGroup) => {
-      const accessoriesForColor = colorImageMap[baseGroup.key] || {};
       baseGroup.variants.forEach((variant) => {
         const variantKeys = [variant.id, toNumericId(variant.id)];
         variantKeys.forEach((key) => {
@@ -753,32 +1094,58 @@ export default function Index() {
         });
       });
 
-      Object.entries(accessoriesForColor).forEach(([accessoryId, entry]) => {
+      const mapForColor = colorImageMap?.[baseGroup.key] || {};
+      Object.entries(mapForColor).forEach(([key, entry]) => {
         if (!entry?.fileUrl) return;
+        const payload = {
+          ...entry,
+          accessoryProductId: entry.accessoryProductId || key,
+          variantId: entry.variantId || key,
+        };
+
+        if (!colorMapToSave[baseGroup.key]) colorMapToSave[baseGroup.key] = {};
+        colorMapToSave[baseGroup.key][key] = payload;
+
+        // Normalize accessory variant keys (both GID and numeric)
+        const accessoryKeys = [key, toNumericId(key)].filter(Boolean);
+
         baseGroup.variants.forEach((baseVariant) => {
           const baseKeys = [baseVariant.id, toNumericId(baseVariant.id)];
           baseKeys.forEach((bKey) => {
             if (!bKey) return;
             if (!variantMap[bKey]) variantMap[bKey] = {};
-            variantMap[bKey][accessoryId] = {
-              fileUrl: entry.fileUrl,
-              fileId: entry.fileId,
-              baseColor: baseGroup.label,
-              accessoryProductId: accessoryId,
-            };
+
+            // Store under both accessory GID and numeric ID
+            accessoryKeys.forEach((accKey) => {
+              variantMap[bKey][accKey] = {
+                ...payload,
+                baseColor: baseGroup.label,
+              };
+            });
           });
         });
       });
     });
 
+    console.log("📦 variantMap built:", variantMap);
+    console.log("🎨 colorMapToSave built:", colorMapToSave);
+
     const formData = new FormData();
     formData.append("action", "save_color_map");
-    formData.append("productId", selectedProductId);
-    formData.append("accessories", JSON.stringify(selectedAccessories));
-    formData.append("colorMap", JSON.stringify(colorImageMap));
-    formData.append("variantMap", JSON.stringify(variantMap));
+    formData.append("rulesetId", selectedRulesetId || "");
+    if (selectedRulesetHandle) formData.append("handle", selectedRulesetHandle);
+    const colorPayload = { ...colorImageMapByBase, [selectedProductId]: colorMapToSave };
+
+    // Merge variantMap directly (not nested under product ID)
+    const existingVariantMap = (rulesetList.find((r) => r.id === selectedRulesetId)?.variantMapByBase as any) || {};
+    const variantPayload = { ...existingVariantMap, ...variantMap };
+
+    console.log("📮 Submitting - colorPayload:", colorPayload);
+    console.log("📮 Submitting - variantPayload:", variantPayload);
+    formData.append("colorMap", JSON.stringify(colorPayload));
+    formData.append("variantMap", JSON.stringify(variantPayload));
     fetcher.submit(formData, { method: "post" });
-    setStep("select");
+    setColorImageMapByBase(colorPayload);
   };
 
   const uploading = fetcher.state !== "idle" && !!fetcher.formData;
@@ -787,165 +1154,862 @@ export default function Index() {
     <Page>
       <TitleBar title="Product Image Customizer" />
       <BlockStack gap="500">
-        <Layout>
-          <Layout.Section>
+        {error && (
+          <Banner tone="critical" title="Error loading products">
+            <p>{JSON.stringify(error)}</p>
+          </Banner>
+        )}
+
+        {step === "list" && (
+          <>
             <Card>
               <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">Choose base product</Text>
-                {error && (
-                  <Banner tone="critical" title="Error loading products">
-                    <p>{JSON.stringify(error)}</p>
-                  </Banner>
-                )}
-                <Select
-                  label="Product"
-                  options={productOptions}
-                  value={selectedProductId || ""}
-                  onChange={(v: string) => {
-                    setSelectedProductId(v || "");
-                    setStep("select");
-                  }}
-                  placeholder="Pick the product to customize"
-                />
-                <InlineStack gap="200">
+                <InlineStack align="space-between" blockAlign="center">
+                  <BlockStack gap="200">
+                    <Text as="h2" variant="headingLg">Image Customization Rules</Text>
+                    <Text as="p" tone="subdued">
+                      Configure product image mappings for accessories and variants
+                    </Text>
+                  </BlockStack>
                   <Button
                     variant="primary"
-                    onClick={handleEnableProduct}
-                    disabled={!selectedProductId || uploading || !selectedProduct}
-                    loading={uploading}
+                    onClick={() => {
+                      setSelectedRulesetId("");
+                      setSelectedRulesetName("New Ruleset");
+                      setSelectedBaseProducts([]);
+                      setRuleCategories([]);
+                      setStep("configure");
+                    }}
                   >
-                    Enable & configure
+                    Create ruleset
                   </Button>
-                  {selectedProduct && (
-                    <Tag>{selectedProduct.variants?.edges?.length || 0} variants</Tag>
-                  )}
-                  {!selectedProduct && (
-                    <Tag tone="critical">No product selected</Tag>
-                  )}
                 </InlineStack>
               </BlockStack>
             </Card>
-          </Layout.Section>
 
-          <Layout.Section>
-            <Card>
-              <Text as="h3" variant="headingMd">Configured products</Text>
-              <List>
-                {enabledProducts.length === 0 && <Text tone="subdued">Nothing enabled yet.</Text>}
-                {enabledProducts.map((p: ProductNode) => (
-                  <Box key={p.id} paddingBlockEnd="200">
-                    <InlineStack align="center">
-                      <Thumbnail size="small" source={p.featuredImage?.url || ""} alt={p.title} />
-                      <Box>
-                        <Text as="p">{p.title}</Text>
-                        <Button onClick={() => handleConfigureTile(p.id)}>Configure</Button>
-                      </Box>
-                    </InlineStack>
-                  </Box>
-                ))}
-              </List>
-            </Card>
-          </Layout.Section>
-
-          {step === "accessories" && selectedProduct && (
-            <Layout.Section>
+            {rulesetList.length === 0 ? (
               <Card>
-                <BlockStack gap="400">
-                  <Text as="h2" variant="headingMd">Select accessories for {selectedProduct.title}</Text>
-                  <ChoiceList
-                    title="Accessories"
-                    choices={accessoryOptions}
-                    selected={selectedAccessories}
-                    onChange={(value) => setSelectedAccessories(value as string[])}
-                    allowMultiple
-                  />
-                  <InlineStack gap="200">
-                    <Button onClick={() => setStep("select")}>Back</Button>
-                    <Button variant="primary" onClick={handleSaveAccessories} disabled={selectedAccessories.length === 0 || uploading}>
-                      Next: Upload combos
-                    </Button>
-                  </InlineStack>
+                <BlockStack gap="300" inlineAlign="center">
+                  <Text as="p" tone="subdued" alignment="center">
+                    No rulesets created yet. Create your first ruleset to get started.
+                  </Text>
+                  <Button
+                    variant="primary"
+                    onClick={() => {
+                      setSelectedRulesetId("");
+                      setSelectedRulesetName("New Ruleset");
+                      setSelectedBaseProducts([]);
+                      setRuleCategories([]);
+                      setStep("configure");
+                    }}
+                  >
+                    Create your first ruleset
+                  </Button>
                 </BlockStack>
               </Card>
-            </Layout.Section>
-          )}
+            ) : (
+              <BlockStack gap="400">
+                {rulesetList.map((ruleset) => {
+                  const baseCount = ruleset.baseProducts?.length || 0;
+                  const catCount = ruleset.categories?.length || 0;
+                  const mappingCount = Object.values(ruleset.colorMapByBase || {}).reduce(
+                    (sum, group) => sum + Object.keys(group).length,
+                    0
+                  );
 
-          {step === "uploads" && selectedProduct && (
-            <Layout.Section>
-              <Card>
-                <BlockStack gap="400">
-                  <Text as="h2" variant="headingMd">Upload images for each color combination</Text>
-                  {baseColorGroups.length === 0 && (
-                    <Text tone="subdued">No variants found on this product.</Text>
-                  )}
-
-                  {baseColorGroups.map((group) => (
-                    <Box key={group.key} paddingBlockEnd="400" paddingBlockStart="200" borderColor="border-subdued" borderWidth="025" borderRadius="200">
-                      <BlockStack gap="200">
-                        <InlineStack align="space-between" blockAlign="center">
-                          <InlineStack gap="150" blockAlign="center">
-                            <Tag>{group.label}</Tag>
-                            <Text tone="subdued">{group.variants.length} variant(s)</Text>
+                  return (
+                    <Card key={ruleset.id}>
+                      <BlockStack gap="400">
+                        <InlineStack align="space-between" blockAlign="start">
+                          <BlockStack gap="200">
+                            <Text as="h3" variant="headingMd">{ruleset.name}</Text>
+                            <InlineStack gap="300">
+                              <InlineStack gap="100" blockAlign="center">
+                                <Text as="span" tone="subdued">📦</Text>
+                                <Text as="span" tone="subdued">{baseCount} base product{baseCount !== 1 ? 's' : ''}</Text>
+                              </InlineStack>
+                              <InlineStack gap="100" blockAlign="center">
+                                <Text as="span" tone="subdued">🏷️</Text>
+                                <Text as="span" tone="subdued">{catCount} categor{catCount !== 1 ? 'ies' : 'y'}</Text>
+                              </InlineStack>
+                              <InlineStack gap="100" blockAlign="center">
+                                <Text as="span" tone="subdued">🖼️</Text>
+                                <Text as="span" tone="subdued">{mappingCount} image mapping{mappingCount !== 1 ? 's' : ''}</Text>
+                              </InlineStack>
+                            </InlineStack>
+                          </BlockStack>
+                          <InlineStack gap="200">
+                            <Button
+                              onClick={() => {
+                                setSelectedRulesetId(ruleset.id);
+                                setStep("configure");
+                              }}
+                            >
+                              Configure
+                            </Button>
+                            <Button
+                              onClick={() => {
+                                setSelectedRulesetId(ruleset.id);
+                                if (ruleset.baseProducts?.length) {
+                                  setSelectedProductId(ruleset.baseProducts[0]);
+                                }
+                                setStep("mappings");
+                              }}
+                              disabled={!baseCount || !catCount}
+                            >
+                              Image mappings
+                            </Button>
+                            <Button
+                              tone="critical"
+                              onClick={() => {
+                                const fd = new FormData();
+                                fd.append("action", "delete_ruleset");
+                                fd.append("rulesetId", ruleset.id);
+                                fetcher.submit(fd, { method: "post" });
+                              }}
+                            >
+                              Delete
+                            </Button>
                           </InlineStack>
                         </InlineStack>
-                        <Divider />
-
-                        {selectedAccessories.length === 0 && (
-                          <Text tone="subdued">Pick accessories first.</Text>
-                        )}
-
-        {selectedAccessories.map((accId) => {
-          const accProduct = accessoryProducts.find((p) => p.id === accId);
-          const existing = colorImageMap?.[group.key]?.[accId];
-          const comboKey = `${group.key}-${accId}`;
-          return (
-            <Box key={`${group.key}-${accId}`} paddingBlockEnd="200">
-              <BlockStack gap="150">
-                <InlineStack align="space-between" blockAlign="center">
-                  <InlineStack gap="150" blockAlign="center">
-                    <Thumbnail size="small" source={accProduct?.featuredImage?.url || ""} alt={accProduct?.title || "Accessory"} />
-                    <Text as="p">{accProduct?.title || "Accessory"}</Text>
-                  </InlineStack>
-                  <Tag tone="attention">Accessory</Tag>
-                </InlineStack>
-
-                <InlineStack align="space-between" blockAlign="center">
-                  <InlineStack gap="150" blockAlign="center">
-                    {existing?.fileUrl && (
-                      <Thumbnail size="small" source={existing.fileUrl} alt="Uploaded" />
-                    )}
-                  </InlineStack>
-                  <Box minWidth="300px">
-                    <SimpleImagePicker
-                      initialUrl={existing?.fileUrl}
-                      uploading={uploadInFlight && uploadingKey === comboKey}
-                      onFileSelected={(file) => handleFileSelected(group.key, accId, file)}
-                    />
-                  </Box>
-                </InlineStack>
-              </BlockStack>
-            </Box>
-          );
-        })}
                       </BlockStack>
-                    </Box>
-                  ))}
+                    </Card>
+                  );
+                })}
+              </BlockStack>
+            )}
+          </>
+        )}
 
-                  <InlineStack gap="200">
-                    <Button onClick={() => setStep("accessories")}>Back</Button>
+        {step === "configure" && (
+          <Card>
+            <BlockStack gap="500">
+              <InlineStack align="space-between" blockAlign="center">
+                <BlockStack gap="200">
+                  <Text as="h2" variant="headingLg">
+                    {selectedRulesetId ? "Edit Ruleset" : "Create New Ruleset"}
+                  </Text>
+                  <Text as="p" tone="subdued">
+                    Configure base products and accessory categories
+                  </Text>
+                </BlockStack>
+                <Button onClick={() => {
+                  setSelectedRulesetId("");
+                  setSelectedRulesetHandle("");
+                  setSelectedRulesetName("Untitled ruleset");
+                  setSelectedBaseProducts([]);
+                  setSelectedProductId("");
+                  setRuleCategories([]);
+                  setColorImageMap({});
+                  setColorImageMapByBase({});
+                  setStep("list");
+                }}>Cancel</Button>
+              </InlineStack>
+
+              <Divider />
+
+              <BlockStack gap="400">
+                <TextField
+                  label="Ruleset name"
+                  value={selectedRulesetName}
+                  onChange={setSelectedRulesetName}
+                  autoComplete="off"
+                  placeholder="Enter a descriptive name"
+                  helpText="Give your ruleset a memorable name"
+                />
+
+                <BlockStack gap="300">
+                  <Text as="h3" variant="headingMd">Base Products</Text>
+                  <Text as="p" tone="subdued">
+                    Select the main products that will display on product detail pages
+                  </Text>
+                  <Button
+                    onClick={async () => {
+                      const selection = await shopify.resourcePicker({
+                        type: 'product',
+                        action: 'select',
+                        multiple: true,
+                        filter: {
+                          hidden: false,
+                          variants: false,
+                        },
+                      });
+                      if (selection && selection.length > 0) {
+                        const newProductIds = selection.map((product: any) => product.id);
+                        const uniqueIds = Array.from(new Set([...selectedBaseProducts, ...newProductIds]));
+                        setSelectedBaseProducts(uniqueIds);
+                        if (!selectedProductId || !uniqueIds.includes(selectedProductId)) {
+                          setSelectedProductId(uniqueIds[0]);
+                        }
+                        if (!selectedRulesetName.trim() || selectedRulesetName === "New Ruleset" || selectedRulesetName === "Untitled ruleset") {
+                          setSelectedRulesetName(`${selection[0].title} Ruleset`);
+                        }
+                      }
+                    }}
+                  >
+                    Browse products
+                  </Button>
+                  {selectedBaseProducts.length > 0 && (
+                    <BlockStack gap="200">
+                      <InlineStack gap="200" wrap>
+                        {selectedBaseProducts.map((pid) => {
+                          const prod = products.find((p) => p && p.id === pid);
+                          return (
+                            <Tag
+                              key={pid}
+                              onRemove={() => {
+                                const newProducts = selectedBaseProducts.filter((p) => p !== pid);
+                                setSelectedBaseProducts(newProducts);
+                                if (selectedProductId === pid) {
+                                  setSelectedProductId(newProducts[0] || "");
+                                }
+                              }}
+                            >
+                              {prod?.title || "Base product"}
+                            </Tag>
+                          );
+                        })}
+                      </InlineStack>
+                      <Button
+                        size="slim"
+                        onClick={() => {
+                          setSelectedBaseProducts([]);
+                          setSelectedProductId("");
+                        }}
+                      >
+                        Clear all
+                      </Button>
+                    </BlockStack>
+                  )}
+                </BlockStack>
+
+                <Divider />
+
+                <BlockStack gap="300">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <BlockStack gap="100">
+                      <Text as="h3" variant="headingMd">Accessory Categories</Text>
+                      <Text as="p" tone="subdued">
+                        Organize accessories into categories for better management
+                      </Text>
+                    </BlockStack>
                     <Button
-                      variant="primary"
-                      onClick={handleSaveColorMap}
-                      disabled={uploading || uploadInFlight || Object.keys(colorImageMap || {}).length === 0}
+                      onClick={() =>
+                        setRuleCategories((prev) => [
+                          ...prev,
+                          { id: `${Date.now()}`, label: "New Category", productIds: [] },
+                        ])
+                      }
                     >
-                      Save mappings
+                      Add category
                     </Button>
                   </InlineStack>
+
+                  {ruleCategories.length === 0 ? (
+                    <Card>
+                      <BlockStack gap="200" inlineAlign="center">
+                        <Text as="p" tone="subdued" alignment="center">
+                          No categories yet. Add a category to organize your accessories.
+                        </Text>
+                      </BlockStack>
+                    </Card>
+                  ) : (
+                    <BlockStack gap="300">
+                      {ruleCategories.map((cat) => (
+                        <Card key={cat.id}>
+                          <BlockStack gap="300">
+                            <InlineStack align="space-between" blockAlign="center">
+                              <Box minWidth="300px">
+                                <TextField
+                                  label="Category name"
+                                  labelHidden
+                                  value={cat.label}
+                                  onChange={(val) =>
+                                    setRuleCategories((prev) =>
+                                      prev.map((c) => (c.id === cat.id ? { ...c, label: val } : c)),
+                                    )
+                                  }
+                                  autoComplete="off"
+                                  placeholder="Category name"
+                                />
+                              </Box>
+                              <InlineStack gap="200">
+                                <Popover
+                                  active={cat.id === accessorySearch}
+                                  activator={
+                                    <Button
+                                      disclosure
+                                      onClick={() => setAccessorySearch(cat.id)}
+                                    >
+                                      {cat.productIds.length
+                                        ? `${cat.productIds.length} product${cat.productIds.length !== 1 ? 's' : ''}`
+                                        : "Select products"}
+                                    </Button>
+                                  }
+                                  onClose={() => setAccessorySearch("")}
+                                  autofocusTarget="first-node"
+                                >
+                                  <Box padding="300" minWidth="320px">
+                                    <Scrollable style={{ maxHeight: "280px" }} shadow>
+                                      <OptionList
+                                        options={productOptions}
+                                        selected={cat.productIds}
+                                        onChange={(value) =>
+                                          setRuleCategories((prev) =>
+                                            prev.map((c) =>
+                                              c.id === cat.id ? { ...c, productIds: value as string[] } : c,
+                                            ),
+                                          )
+                                        }
+                                        allowMultiple
+                                      />
+                                    </Scrollable>
+                                  </Box>
+                                </Popover>
+                                <Button
+                                  tone="critical"
+                                  onClick={() =>
+                                    setRuleCategories((prev) => prev.filter((c) => c.id !== cat.id))
+                                  }
+                                >
+                                  Remove
+                                </Button>
+                              </InlineStack>
+                            </InlineStack>
+                            {cat.productIds.length > 0 && (
+                              <InlineStack gap="150" wrap>
+                                {cat.productIds.map((pid) => {
+                                  const prod = products.find((p) => p && p.id === pid);
+                                  return (
+                                    <Tag
+                                      key={pid}
+                                      onRemove={() =>
+                                        setRuleCategories((prev) =>
+                                          prev.map((c) =>
+                                            c.id === cat.id
+                                              ? { ...c, productIds: c.productIds.filter((p) => p !== pid) }
+                                              : c,
+                                          ),
+                                        )
+                                      }
+                                    >
+                                      {prod?.title || "Product"}
+                                    </Tag>
+                                  );
+                                })}
+                              </InlineStack>
+                            )}
+                          </BlockStack>
+                        </Card>
+                      ))}
+                    </BlockStack>
+                  )}
+                </BlockStack>
+              </BlockStack>
+
+              <Divider />
+
+              <InlineStack align="end" gap="200">
+                <Button onClick={() => setStep("list")}>Cancel</Button>
+                <Button
+                  variant="primary"
+                  onClick={() => {
+                    if (!selectedRulesetId) {
+                      // Create new ruleset first
+                      const fd = new FormData();
+                      fd.append("action", "create_ruleset");
+                      fd.append("name", selectedRulesetName || "Ruleset");
+                      fetcher.submit(fd, { method: "post" });
+                    } else {
+                      // Save existing ruleset
+                      const fd = new FormData();
+                      fd.append("action", "save_ruleset");
+                      fd.append("rulesetId", selectedRulesetId);
+                      if (selectedRulesetHandle) fd.append("handle", selectedRulesetHandle);
+                      fd.append("name", (selectedRulesetName || "").trim() || "Ruleset");
+                      fd.append("baseProducts", JSON.stringify(selectedBaseProducts));
+                      fd.append("categories", JSON.stringify(ruleCategories));
+                      fd.append("colorMap", JSON.stringify(colorImageMapByBase));
+                      fd.append("variantMap", JSON.stringify({}));
+                      fetcher.submit(fd, { method: "post" });
+                    }
+                  }}
+                  disabled={!selectedProductId || selectedBaseProducts.length === 0}
+                  loading={fetcher.state !== "idle"}
+                >
+                  {selectedRulesetId ? "Save & continue to mappings" : "Create & continue"}
+                </Button>
+              </InlineStack>
+            </BlockStack>
+          </Card>
+        )}
+
+        {step === "mappings" && selectedProduct && selectedBaseProducts.includes(selectedProductId) && (
+          <Card>
+            <BlockStack gap="400">
+              <InlineStack align="space-between" blockAlign="center">
+                <BlockStack gap="200">
+                  <Text as="h2" variant="headingLg">Image Mappings</Text>
+                  <Text as="p" tone="subdued">
+                    Configure images for {selectedProduct.title}
+                  </Text>
+                </BlockStack>
+                <InlineStack gap="200">
+                  <Select
+                    label="Base product"
+                    labelHidden
+                    options={selectedBaseProducts.map((pid) => {
+                      const prod = products.find((p) => p && p.id === pid);
+                      return { label: prod?.title || "Product", value: pid };
+                    })}
+                    value={selectedProductId}
+                    onChange={(val) => setSelectedProductId(val)}
+                  />
+                  <Button onClick={() => setStep("configure")}>Back to configuration</Button>
+                </InlineStack>
+              </InlineStack>
+
+              <Divider />
+
+              {uploadError && (
+                <Banner tone="critical" title="Image upload failed">
+                  <p>{typeof uploadError === "string" ? uploadError : "Please try again."}</p>
+                </Banner>
+              )}
+
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h3" variant="headingMd">Mapping mode</Text>
+                  <InlineStack gap="300">
+                    <Button
+                      variant={mappingMode === "create_specific" ? "primary" : undefined}
+                      onClick={() => setMappingMode("create_specific")}
+                    >
+                      Create specific mapping
+                    </Button>
+                    <Button
+                      variant={mappingMode === "show_all" ? "primary" : undefined}
+                      onClick={() => setMappingMode("show_all")}
+                    >
+                      Show all combinations
+                    </Button>
+                  </InlineStack>
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    {mappingMode === "create_specific"
+                      ? "Manually select which variants to map - cleaner and focused approach"
+                      : "View all possible combinations automatically - comprehensive but lengthy"}
+                  </Text>
                 </BlockStack>
               </Card>
-            </Layout.Section>
-          )}
-        </Layout>
+
+              {mappingMode === "create_specific" && (
+                <Card>
+                  <BlockStack gap="300">
+                    <Text as="h3" variant="headingMd">Create new mapping</Text>
+
+                    <Select
+                      label="Select base product variant"
+                      options={baseColorGroups.flatMap((group) =>
+                        group.variants.map((variant) => ({
+                          label: `${group.label} - ${variant.title}`,
+                          value: variant.id,
+                        }))
+                      )}
+                      value={selectedBaseVariantId}
+                      onChange={setSelectedBaseVariantId}
+                      placeholder="Choose a variant"
+                    />
+
+                    {selectedBaseVariantId && (
+                      <>
+                        <Divider />
+                        <Text as="p" variant="bodyMd">Select accessory variant(s)</Text>
+                        <BlockStack gap="200">
+                          {selectedAccessories.map((accId) => {
+                            const accProduct = accessoryProducts.find((p) => p.id === accId);
+                            const variantIds = resolveAccessoryVariantIds(accId);
+
+                            return (
+                              <Box key={accId} padding="300" borderColor="border-subdued" borderWidth="025" borderRadius="200">
+                                <BlockStack gap="200">
+                                  <InlineStack gap="150" blockAlign="center">
+                                    <Thumbnail size="small" source={accProduct?.featuredImage?.url || ""} alt={accProduct?.title || "Accessory"} />
+                                    <Text as="p" variant="bodyMd">{accProduct?.title || "Accessory"}</Text>
+                                  </InlineStack>
+
+                                  <Select
+                                    label="Variant"
+                                    labelHidden
+                                    options={[
+                                      { label: "Select a variant", value: "" },
+                                      ...variantIds.map((variantId) => ({
+                                        label: resolveAccessoryVariantTitle(accId, variantId),
+                                        value: variantId,
+                                      })),
+                                    ]}
+                                    value={selectedMappingAccessories.find((v) => variantIds.includes(v)) || ""}
+                                    onChange={(val) => {
+                                      if (!val) {
+                                        setSelectedMappingAccessories((prev) =>
+                                          prev.filter((v) => !variantIds.includes(v))
+                                        );
+                                      } else {
+                                        setSelectedMappingAccessories((prev) => {
+                                          const filtered = prev.filter((v) => !variantIds.includes(v));
+                                          return [...filtered, val];
+                                        });
+                                      }
+                                    }}
+                                  />
+                                </BlockStack>
+                              </Box>
+                            );
+                          })}
+                        </BlockStack>
+
+                        {selectedMappingAccessories.length > 0 && (
+                          <>
+                            <Divider />
+                            <Card>
+                              <BlockStack gap="200">
+                                <Text as="p" variant="headingMd">Upload image for this mapping</Text>
+                                <Text as="p" tone="subdued" variant="bodySm">
+                                  Base: {(() => {
+                                    const baseGroup = baseColorGroups.find((g) =>
+                                      g.variants.some((v) => v.id === selectedBaseVariantId)
+                                    );
+                                    const baseVariant = baseGroup?.variants.find((v) => v.id === selectedBaseVariantId);
+                                    return `${baseGroup?.label} - ${baseVariant?.title}`;
+                                  })()}
+                                </Text>
+                                <Text as="p" tone="subdued" variant="bodySm">
+                                  Accessories: {selectedMappingAccessories.map((variantId) => {
+                                    const accId = selectedAccessories.find((id) => {
+                                      const prod = products.find((p) => p && p.id === id);
+                                      return prod?.variants?.edges?.some((e) => e.node.id === variantId);
+                                    });
+                                    const prod = products.find((p) => p && p.id === accId);
+                                    return `${prod?.title} - ${resolveAccessoryVariantTitle(accId || "", variantId)}`;
+                                  }).join(", ")}
+                                </Text>
+
+                                <Box minWidth="300px">
+                                  <SimpleImagePicker
+                                    initialUrl={(() => {
+                                      const baseGroup = baseColorGroups.find((g) =>
+                                        g.variants.some((v) => v.id === selectedBaseVariantId)
+                                      );
+                                      if (!baseGroup) return undefined;
+
+                                      if (selectedMappingAccessories.length === 1) {
+                                        return colorImageMap?.[baseGroup.key]?.[selectedMappingAccessories[0]]?.fileUrl;
+                                      } else {
+                                        const comboKey = buildCombinationKey(selectedMappingAccessories);
+                                        return colorImageMap?.[baseGroup.key]?.[comboKey]?.fileUrl;
+                                      }
+                                    })()}
+                                    uploading={uploadInFlight}
+                                    onFileSelected={(file) => {
+                                      const baseGroup = baseColorGroups.find((g) =>
+                                        g.variants.some((v) => v.id === selectedBaseVariantId)
+                                      );
+                                      if (!baseGroup) return;
+
+                                      if (selectedMappingAccessories.length === 1) {
+                                        const accId = selectedAccessories.find((id) => {
+                                          const prod = products.find((p) => p.id === id);
+                                          return prod?.variants?.edges?.some((e) => e.node.id === selectedMappingAccessories[0]);
+                                        }) || selectedMappingAccessories[0];
+                                        handleFileSelected(
+                                          baseGroup.key,
+                                          accId,
+                                          selectedMappingAccessories[0],
+                                          file
+                                        );
+                                      } else {
+                                        const comboKey = buildCombinationKey(selectedMappingAccessories);
+                                        const accessoryIds = selectedMappingAccessories.map((variantId) => {
+                                          return selectedAccessories.find((id) => {
+                                            const prod = products.find((p) => p.id === id);
+                                            return prod?.variants?.edges?.some((e) => e.node.id === variantId);
+                                          }) || variantId;
+                                        });
+                                        handleFileSelected(
+                                          baseGroup.key,
+                                          comboKey,
+                                          comboKey,
+                                          file,
+                                          {
+                                            combinationKey: comboKey,
+                                            accessoryIds,
+                                            variantIds: selectedMappingAccessories,
+                                          }
+                                        );
+                                      }
+                                    }}
+                                  />
+                                </Box>
+                              </BlockStack>
+                            </Card>
+                          </>
+                        )}
+                      </>
+                    )}
+                  </BlockStack>
+                </Card>
+              )}
+
+              {baseColorGroups.length === 0 && <Text as="p" tone="subdued">No variants found.</Text>}
+
+              {Object.keys(colorImageMap || {}).length > 0 && (
+                <Card>
+                  <BlockStack gap="300">
+                    <Text as="h3" variant="headingMd">Existing mappings ({Object.values(colorImageMap || {}).reduce((sum, group) => sum + Object.keys(group).length, 0)})</Text>
+                    {baseColorGroups.map((group) => {
+                      const groupMappings = colorImageMap?.[group.key] || {};
+                      const mappingCount = Object.keys(groupMappings).length;
+
+                      if (mappingCount === 0) return null;
+
+                      return (
+                        <Box key={`existing-${group.key}`} padding="200" borderColor="border-subdued" borderWidth="025" borderRadius="200">
+                          <BlockStack gap="200">
+                            <InlineStack gap="200" blockAlign="center">
+                              <Tag>{group.label}</Tag>
+                              <Text as="p" tone="subdued" variant="bodySm">{mappingCount} mapping(s)</Text>
+                            </InlineStack>
+
+                            <BlockStack gap="150">
+                              {Object.entries(groupMappings).map(([key, mapping]) => {
+                                const isCombo = !!(mapping.combinationKey || mapping.accessoryIds);
+
+                                return (
+                                  <Box key={`mapping-${key}`} padding="200" background="bg-surface-secondary" borderRadius="150">
+                                    <InlineStack align="space-between" blockAlign="center">
+                                      <InlineStack gap="150" blockAlign="center">
+                                        <Thumbnail size="small" source={mapping.fileUrl} alt="Mapping" />
+                                        <BlockStack gap="050">
+                                          {isCombo ? (
+                                            <>
+                                              <Text as="p" variant="bodySm">Combination mapping</Text>
+                                              <Text as="p" tone="subdued" variant="bodySm">
+                                                {(mapping.variantIds || []).map((vId: string) => {
+                                                  const accId = selectedAccessories.find((id) => {
+                                                    const prod = products.find((p) => p && p.id === id);
+                                                    return prod?.variants?.edges?.some((e) => e.node.id === vId);
+                                                  });
+                                                  const prod = products.find((p) => p && p.id === accId);
+                                                  const variant = prod?.variants?.edges?.find((e) => e.node.id === vId)?.node;
+                                                  return `${prod?.title || "Accessory"} - ${variant?.title || "Variant"}`;
+                                                }).join(" + ")}
+                                              </Text>
+                                            </>
+                                          ) : (
+                                            <>
+                                              <Text as="p" variant="bodySm">
+                                                {(() => {
+                                                  const accId = mapping.accessoryProductId || key;
+                                                  const prod = products.find((p) => p && p.id === accId);
+                                                  return prod?.title || "Accessory";
+                                                })()}
+                                              </Text>
+                                              <Text as="p" tone="subdued" variant="bodySm">
+                                                {resolveAccessoryVariantTitle(mapping.accessoryProductId || key, mapping.variantId || key)}
+                                              </Text>
+                                            </>
+                                          )}
+                                        </BlockStack>
+                                      </InlineStack>
+                                      <Button
+                                        tone="critical"
+                                        size="slim"
+                                        onClick={() => {
+                                          setColorImageMap((prev) => {
+                                            const next = { ...prev } as ColorImageMap;
+                                            if (next[group.key]) {
+                                              const copy = { ...next[group.key] } as any;
+                                              delete copy[key];
+                                              next[group.key] = copy;
+                                            }
+                                            return next;
+                                          });
+                                        }}
+                                      >
+                                        Remove
+                                      </Button>
+                                    </InlineStack>
+                                  </Box>
+                                );
+                              })}
+                            </BlockStack>
+                          </BlockStack>
+                        </Box>
+                      );
+                    })}
+                  </BlockStack>
+                </Card>
+              )}
+
+              {mappingMode === "show_all" && baseColorGroups.map((group) => {
+                const isExpanded = expandedGroups.has(group.key);
+                const mappingCount = Object.keys(colorImageMap?.[group.key] || {}).length;
+
+                return (
+                  <Card key={group.key}>
+                    <BlockStack gap="200">
+                      <Box
+                        as="button"
+                        width="100%"
+                        paddingBlock="300"
+                        paddingInline="400"
+                        background={isExpanded ? "bg-surface-hover" : "bg-surface"}
+                        borderRadius="200"
+                        onClick={() => {
+                          setExpandedGroups((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(group.key)) {
+                              next.delete(group.key);
+                            } else {
+                              next.add(group.key);
+                            }
+                            return next;
+                          });
+                        }}
+                      >
+                        <InlineStack align="space-between" blockAlign="center">
+                          <InlineStack gap="200" blockAlign="center">
+                            <Tag>{group.label}</Tag>
+                            <Text tone="subdued">{group.variants.length} variant(s)</Text>
+                            {mappingCount > 0 && (
+                              <Tag tone="success">{mappingCount} mapped</Tag>
+                            )}
+                          </InlineStack>
+                          <Text variant="bodyMd">{isExpanded ? "▼" : "▶"}</Text>
+                        </InlineStack>
+                      </Box>
+
+                      {isExpanded && (
+                        <Box paddingInline="400" paddingBlockEnd="400">
+                          <BlockStack gap="300">
+                            {selectedAccessories.length === 0 && (
+                              <Text tone="subdued">Add accessory categories to upload mappings.</Text>
+                            )}
+
+                            {selectedAccessories.flatMap((accId) => {
+                              const accProduct = accessoryProducts.find((p) => p.id === accId);
+                              const variantIds = resolveAccessoryVariantIds(accId);
+                              return variantIds.map((accessoryVariantId) => {
+                                const accessoryVariantTitle = resolveAccessoryVariantTitle(accId, accessoryVariantId);
+                                const existing = colorImageMap?.[group.key]?.[accessoryVariantId];
+                                const comboKey = `${group.key}-${accessoryVariantId}`;
+                                return (
+                                  <Box key={`${group.key}-${accId}-${accessoryVariantId}`} paddingBlockEnd="200">
+                                    <BlockStack gap="150">
+                                      <InlineStack align="space-between" blockAlign="center">
+                                        <InlineStack gap="150" blockAlign="center">
+                                          <Thumbnail size="small" source={accProduct?.featuredImage?.url || ""} alt={accProduct?.title || "Accessory"} />
+                                          <BlockStack gap="050">
+                                            <Text as="p">{accProduct?.title || "Accessory"}</Text>
+                                            <Text tone="subdued" variant="bodySm">{accessoryVariantTitle}</Text>
+                                          </BlockStack>
+                                        </InlineStack>
+                                        <Tag tone="attention">Accessory</Tag>
+                                      </InlineStack>
+
+                                      <InlineStack align="space-between" blockAlign="center">
+                                        <InlineStack gap="150" blockAlign="center">
+                                          {existing?.fileUrl && (
+                                            <Thumbnail size="small" source={existing.fileUrl} alt="Uploaded" />
+                                          )}
+                                        </InlineStack>
+                                        <Box minWidth="300px">
+                                          <SimpleImagePicker
+                                            initialUrl={existing?.fileUrl}
+                                            uploading={uploadInFlight && uploadingKey === comboKey}
+                                            onFileSelected={(file) => handleFileSelected(group.key, accId, accessoryVariantId, file)}
+                                          />
+                                        </Box>
+                                      </InlineStack>
+                                    </BlockStack>
+                                  </Box>
+                                );
+                              });
+                            })}
+                            {categoryCombinations.length > 0 && (
+                              <BlockStack gap="150">
+                                <Divider />
+                                <Text as="p" variant="bodySm">Category combinations</Text>
+                                {categoryCombinations.map((combo) => {
+                                  const existingCombo = colorImageMap?.[group.key]?.[combo.key];
+                                  const comboLabel = combo.labels.join(" + ");
+                                  const comboKey = `${group.key}-${combo.key}`;
+                                  return (
+                                    <Box key={`${group.key}-${combo.key}`} paddingBlockEnd="150">
+                                      <InlineStack align="space-between" blockAlign="center">
+                                        <BlockStack gap="050">
+                                          <Text as="p">{comboLabel}</Text>
+                                          <Text tone="subdued" variant="bodySm">Applies when all selected</Text>
+                                          {existingCombo?.fileUrl && (
+                                            <Thumbnail size="small" source={existingCombo.fileUrl} alt="Uploaded" />
+                                          )}
+                                        </BlockStack>
+                                        <Box minWidth="300px">
+                                          <SimpleImagePicker
+                                            initialUrl={existingCombo?.fileUrl}
+                                            uploading={uploadInFlight && uploadingKey === comboKey}
+                                            onFileSelected={(file) =>
+                                              handleFileSelected(group.key, combo.key, combo.key, file, {
+                                                combinationKey: combo.key,
+                                                accessoryIds: combo.accessoryIds,
+                                                variantIds: combo.variantIds,
+                                              })
+                                            }
+                                          />
+                                        </Box>
+                                      </InlineStack>
+                                    </Box>
+                                  );
+                                })}
+                              </BlockStack>
+                            )}
+                          </BlockStack>
+                        </Box>
+                      )}
+                    </BlockStack>
+                  </Card>
+                );
+              })}
+
+              <InlineStack gap="200">
+                <Button onClick={() => setStep("configure")}>Back to configuration</Button>
+                <Button
+                  variant="primary"
+                  onClick={() => {
+                    // Save FIRST with current data, then clear and navigate
+                    handleSaveColorMap();
+
+                    // Use setTimeout to allow save to submit, then clear state
+                    setTimeout(() => {
+                      setSelectedRulesetId("");
+                      setSelectedRulesetHandle("");
+                      setSelectedRulesetName("Untitled ruleset");
+                      setSelectedBaseProducts([]);
+                      setSelectedProductId("");
+                      setRuleCategories([]);
+                      setColorImageMap({});
+                      setColorImageMapByBase({});
+                      setStep("list");
+                    }, 100);
+                  }}
+                  disabled={uploading || uploadInFlight || Object.keys(colorImageMap || {}).length === 0}
+                  loading={uploading || uploadInFlight}
+                >
+                  Save & return to rulesets
+                </Button>
+              </InlineStack>
+            </BlockStack>
+          </Card>
+        )}
       </BlockStack>
     </Page>
   );

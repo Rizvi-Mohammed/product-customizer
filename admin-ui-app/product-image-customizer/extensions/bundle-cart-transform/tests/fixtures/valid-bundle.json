@@ -1,0 +1,105 @@
+{
+  "payload": {
+    "export": "cart-transform-run",
+    "target": "cart.transform.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/BASE",
+            "quantity": 1,
+            "bundleGroupIdAttr": {
+              "__typename": "Attribute",
+              "key": "_bundleGroupId",
+              "value": "group-1"
+            },
+            "bundleRoleAttr": {
+              "__typename": "Attribute",
+              "key": "_bundleRole",
+              "value": "base"
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/BASE",
+              "bundle_config": {
+                "__typename": "Metafield",
+                "jsonValue": {
+                  "allowedComponents": [
+                    "gid://shopify/ProductVariant/COMP1",
+                    "gid://shopify/ProductVariant/COMP2"
+                  ],
+                  "minComponents": 1,
+                  "maxComponents": 3
+                }
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/COMP1",
+            "quantity": 1,
+            "bundleGroupIdAttr": {
+              "__typename": "Attribute",
+              "key": "_bundleGroupId",
+              "value": "group-1"
+            },
+            "bundleRoleAttr": {
+              "__typename": "Attribute",
+              "key": "_bundleRole",
+              "value": "component"
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/COMP1",
+              "bundle_config": null
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/COMP2",
+            "quantity": 1,
+            "bundleGroupIdAttr": {
+              "__typename": "Attribute",
+              "key": "_bundleGroupId",
+              "value": "group-1"
+            },
+            "bundleRoleAttr": {
+              "__typename": "Attribute",
+              "key": "_bundleRole",
+              "value": "component"
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/COMP2",
+              "bundle_config": null
+            }
+          }
+        ]
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "expand": {
+            "cartLineId": "gid://shopify/CartLine/BASE",
+            "expandedCartItems": [
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/COMP1",
+                "quantity": 1,
+                "price": null,
+                "attributes": null
+              },
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/COMP2",
+                "quantity": 1,
+                "price": null,
+                "attributes": null
+              }
+            ],
+            "price": null,
+            "image": null,
+            "title": null
+          }
+        }
+      ]
+    }
+  }
+}

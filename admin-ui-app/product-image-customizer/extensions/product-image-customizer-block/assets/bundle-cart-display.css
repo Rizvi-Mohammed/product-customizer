@@ -1,0 +1,27 @@
+/* Bundle Cart Display Styles */
+.bundle-cart-wrapper {
+    /* Placeholder styles for bundle cart display */
+}
+
+.bundle-group {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 16px;
+}
+
+.bundle-parent {
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
+.bundle-components {
+    padding-left: 16px;
+    border-left: 2px solid #e5e7eb;
+}
+
+.bundle-component {
+    font-size: 0.9em;
+    color: #6b7280;
+    margin: 4px 0;
+}

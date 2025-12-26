@@ -1,0 +1,193 @@
+{% comment %}
+  Renders cart items with bundle grouping
+  Usage: {% render 'bundle-cart-item', item: cart_item %}
+{% endcomment %}
+
+{% assign bundle_group_id = item.properties.bundleGroupId | default: item.properties._bundleGroupId %}
+{% assign bundle_role = item.properties.bundleRole | default: item.properties._bundleRole %}
+
+{% if bundle_role == 'base' %}
+  {%- comment -%} This is a parent bundle item {%- endcomment -%}
+  <div class="cart-item bundle-parent" data-bundle-id="{{ bundle_group_id }}" data-cart-item="{{ item.key }}">
+    <div class="cart-item__media">
+      {% if item.image %}
+        <img src="{{ item.image | image_url: width: 150 }}" 
+             alt="{{ item.image.alt | escape }}"
+             loading="lazy"
+             width="150"
+             height="{{ 150 | divided_by: item.image.aspect_ratio | ceil }}">
+      {% endif %}
+    </div>
+    
+    <div class="cart-item__details">
+      <a href="{{ item.url }}" class="cart-item__name">
+        {{ item.product.title }}
+      </a>
+      
+      {% if item.product.has_only_default_variant == false or item.properties.size > 0 or item.selling_plan_allocation %}
+        <dl class="cart-item__options">
+          {% unless item.product.has_only_default_variant %}
+            {% for option in item.options_with_values %}
+              <div class="product-option">
+                <dt>{{ option.name }}:</dt>
+                <dd>{{ option.value }}</dd>
+              </div>
+            {% endfor %}
+          {% endunless %}
+        </dl>
+      {% endif %}
+      
+      <div class="cart-item__quantity">
+        <label for="Quantity-{{ item.index | plus: 1 }}">Quantity</label>
+        <input type="number" 
+               id="Quantity-{{ item.index | plus: 1 }}"
+               name="updates[]" 
+               value="{{ item.quantity }}" 
+               min="0"
+               data-index="{{ item.index | plus: 1 }}">
+      </div>
+      
+      <div class="cart-item__price">
+        {{ item.final_line_price | money }}
+      </div>
+      
+      <div class="cart-item__remove">
+        <a href="{{ item.url_to_remove }}" class="button button--tertiary">Remove</a>
+      </div>
+    </div>
+  </div>
+  
+  {%- comment -%} Find and render bundled accessories {%- endcomment -%}
+  <div class="bundle-components" data-parent-bundle="{{ bundle_group_id }}">
+    {% for cart_item in cart.items %}
+      {% assign comp_bundle_id = cart_item.properties.bundleGroupId | default: cart_item.properties._bundleGroupId %}
+      {% assign comp_role = cart_item.properties.bundleRole | default: cart_item.properties._bundleRole %}
+      
+      {% if comp_bundle_id == bundle_group_id and comp_role == 'component' %}
+        <div class="cart-item bundle-component" data-bundle-id="{{ comp_bundle_id }}" data-cart-item="{{ cart_item.key }}">
+          <div class="cart-item__media cart-item__media--small">
+            {% if cart_item.image %}
+              <img src="{{ cart_item.image | image_url: width: 80 }}" 
+                   alt="{{ cart_item.image.alt | escape }}"
+                   loading="lazy"
+                   width="80">
+            {% endif %}
+          </div>
+          
+          <div class="cart-item__details">
+            <span class="bundle-indicator">└─</span>
+            <a href="{{ cart_item.url }}" class="cart-item__name">
+              {{ cart_item.product.title }}
+            </a>
+            
+            {% unless cart_item.product.has_only_default_variant %}
+              <div class="cart-item__options">
+                {% for option in cart_item.options_with_values %}
+                  <span class="cart-item__option">{{ option.value }}</span>
+                {% endfor %}
+              </div>
+            {% endunless %}
+            
+            <div class="cart-item__price">
+              {{ cart_item.final_line_price | money }}
+            </div>
+          </div>
+        </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+
+{% elsif bundle_role == 'component' %}
+  {%- comment -%} Skip rendering - will be rendered under parent {%- endcomment -%}
+  
+{% else %}
+  {%- comment -%} Regular non-bundle item {%- endcomment -%}
+  <div class="cart-item" data-cart-item="{{ item.key }}">
+    <div class="cart-item__media">
+      {% if item.image %}
+        <img src="{{ item.image | image_url: width: 150 }}" 
+             alt="{{ item.image.alt | escape }}"
+             loading="lazy"
+             width="150"
+             height="{{ 150 | divided_by: item.image.aspect_ratio | ceil }}">
+      {% endif %}
+    </div>
+    
+    <div class="cart-item__details">
+      <a href="{{ item.url }}" class="cart-item__name">
+        {{ item.product.title }}
+      </a>
+      
+      {% if item.product.has_only_default_variant == false or item.properties.size > 0 %}
+        <dl class="cart-item__options">
+          {% unless item.product.has_only_default_variant %}
+            {% for option in item.options_with_values %}
+              <div class="product-option">
+                <dt>{{ option.name }}:</dt>
+                <dd>{{ option.value }}</dd>
+              </div>
+            {% endfor %}
+          {% endunless %}
+        </dl>
+      {% endif %}
+      
+      <div class="cart-item__quantity">
+        <label for="Quantity-{{ item.index | plus: 1 }}">Quantity</label>
+        <input type="number" 
+               id="Quantity-{{ item.index | plus: 1 }}"
+               name="updates[]" 
+               value="{{ item.quantity }}" 
+               min="0"
+               data-index="{{ item.index | plus: 1 }}">
+      </div>
+      
+      <div class="cart-item__price">
+        {{ item.final_line_price | money }}
+      </div>
+      
+      <div class="cart-item__remove">
+        <a href="{{ item.url_to_remove }}" class="button button--tertiary">Remove</a>
+      </div>
+    </div>
+  </div>
+{% endif %}
+
+<style>
+  .bundle-parent {
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 8px;
+    background: #fafafa;
+  }
+  
+  .bundle-components {
+    margin-left: 20px;
+    padding-left: 20px;
+    border-left: 2px solid #ccc;
+    margin-bottom: 20px;
+  }
+  
+  .bundle-component {
+    padding: 12px;
+    margin-bottom: 8px;
+    background: white;
+    border-radius: 4px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  
+  .bundle-indicator {
+    font-size: 20px;
+    color: #666;
+    margin-right: 8px;
+  }
+  
+  .cart-item__media--small img {
+    width: 60px;
+    height: 60px;
+    object-fit: cover;
+    border-radius: 4px;
+  }
+</style>

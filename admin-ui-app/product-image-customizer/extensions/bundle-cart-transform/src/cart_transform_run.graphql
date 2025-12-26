@@ -1,0 +1,34 @@
+query RunInput {
+  cart {
+    lines {
+      id
+      quantity
+      cost {
+        amountPerQuantity {
+          amount
+        }
+      }
+      merchandise {
+        ... on ProductVariant {
+          id
+          product {
+            id
+            title
+          }
+        }
+      }
+      bundleGroupId: attribute(key: "_bundleGroupId") {
+        value
+      }
+      bundleGroupIdAlt: attribute(key: "bundleGroupId") {
+        value
+      }
+      bundleRole: attribute(key: "_bundleRole") {
+        value
+      }
+      bundleRoleAlt: attribute(key: "bundleRole") {
+        value
+      }
+    }
+  }
+}
