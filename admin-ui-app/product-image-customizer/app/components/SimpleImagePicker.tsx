@@ -1,5 +1,5 @@
-import {useCallback, useEffect, useMemo, useState} from "react";
-import {BlockStack, Button, DropZone, InlineStack, Text, Thumbnail} from "@shopify/polaris";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { BlockStack, Button, DropZone, InlineStack, Text, Thumbnail, Spinner } from "@shopify/polaris";
 
 type Props = {
   initialUrl?: string;
@@ -7,7 +7,7 @@ type Props = {
   onFileSelected: (file: File | null) => void;
 };
 
-export function SimpleImagePicker({initialUrl, uploading = false, onFileSelected}: Props) {
+export function SimpleImagePicker({ initialUrl, uploading = false, onFileSelected }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | undefined>(initialUrl);
 
@@ -52,6 +52,12 @@ export function SimpleImagePicker({initialUrl, uploading = false, onFileSelected
       <DropZone accept="image/*" type="image" allowMultiple={false} onDrop={handleDrop} disabled={uploading}>
         <DropZone.FileUpload actionHint={uploading ? "Uploading..." : "Upload an image"} />
       </DropZone>
+      {uploading && (
+        <InlineStack gap="200" blockAlign="center">
+          <Spinner size="small" />
+          <Text tone="subdued" variant="bodySm">Uploading image...</Text>
+        </InlineStack>
+      )}
       {previewUrl && (
         <InlineStack gap="150" blockAlign="center">
           <Thumbnail alt={fileName || "Selected image"} size="small" source={previewUrl} />

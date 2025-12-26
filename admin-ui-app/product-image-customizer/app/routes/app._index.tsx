@@ -19,7 +19,15 @@ import {
   OptionList,
   TextField,
   Scrollable,
+  Collapsible,
+  Spinner,
+  Icon,
 } from "@shopify/polaris";
+import {
+  ProductIcon,
+  CollectionIcon,
+  ImageIcon,
+} from "@shopify/polaris-icons";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { SimpleImagePicker } from "../components/SimpleImagePicker";
@@ -667,12 +675,10 @@ export default function Index() {
   const [openBaseProductPicker, setOpenBaseProductPicker] = useState(false);
   const uploadInFlight = uploadFetcher.state !== "idle";
   const uploadError = (uploadFetcher.data as any)?.error;
-  const uploadingKey = useMemo(() => {
-    const fd = uploadFetcher.formData;
-    if (!fd) return null;
-    const variantId = fd.get("accessoryVariantId");
-    return `${fd.get("baseColorKey")}-${variantId || fd.get("accessoryId")}`;
-  }, [uploadFetcher.formData]);
+  // Derive upload state directly from fetcher for better Polaris compliance
+  const uploadingKey = uploadFetcher.formData
+    ? `${uploadFetcher.formData.get("baseColorKey")}-${uploadFetcher.formData.get("accessoryVariantId") || uploadFetcher.formData.get("accessoryId")}`
+    : null;
 
   const selectedProduct = useMemo(
     () => products.find((p: ProductNode) => p.id === selectedProductId),
@@ -1225,15 +1231,15 @@ export default function Index() {
                             <Text as="h3" variant="headingMd">{ruleset.name}</Text>
                             <InlineStack gap="300">
                               <InlineStack gap="100" blockAlign="center">
-                                <Text as="span" tone="subdued">📦</Text>
+                                <Icon source={ProductIcon} tone="subdued" />
                                 <Text as="span" tone="subdued">{baseCount} base product{baseCount !== 1 ? 's' : ''}</Text>
                               </InlineStack>
                               <InlineStack gap="100" blockAlign="center">
-                                <Text as="span" tone="subdued">🏷️</Text>
+                                <Icon source={CollectionIcon} tone="subdued" />
                                 <Text as="span" tone="subdued">{catCount} categor{catCount !== 1 ? 'ies' : 'y'}</Text>
                               </InlineStack>
                               <InlineStack gap="100" blockAlign="center">
-                                <Text as="span" tone="subdued">🖼️</Text>
+                                <Icon source={ImageIcon} tone="subdued" />
                                 <Text as="span" tone="subdued">{mappingCount} image mapping{mappingCount !== 1 ? 's' : ''}</Text>
                               </InlineStack>
                             </InlineStack>
@@ -1857,26 +1863,25 @@ export default function Index() {
                 return (
                   <Card key={group.key}>
                     <BlockStack gap="200">
-                      <Box
-                        as="button"
-                        width="100%"
-                        paddingBlock="300"
-                        paddingInline="400"
-                        background={isExpanded ? "bg-surface-hover" : "bg-surface"}
-                        borderRadius="200"
-                        onClick={() => {
-                          setExpandedGroups((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(group.key)) {
-                              next.delete(group.key);
-                            } else {
-                              next.add(group.key);
-                            }
-                            return next;
-                          });
-                        }}
-                      >
-                        <InlineStack align="space-between" blockAlign="center">
+                      <Box paddingBlock="300" paddingInline="400">
+                        <Button
+                          fullWidth
+                          textAlign="start"
+                          disclosure={isExpanded ? "up" : "down"}
+                          ariaExpanded={isExpanded}
+                          ariaControls={`collapsible-${group.key}`}
+                          onClick={() => {
+                            setExpandedGroups((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(group.key)) {
+                                next.delete(group.key);
+                              } else {
+                                next.add(group.key);
+                              }
+                              return next;
+                            });
+                          }}
+                        >
                           <InlineStack gap="200" blockAlign="center">
                             <Tag>{group.label}</Tag>
                             <Text tone="subdued">{group.variants.length} variant(s)</Text>
@@ -1884,11 +1889,14 @@ export default function Index() {
                               <Tag tone="success">{mappingCount} mapped</Tag>
                             )}
                           </InlineStack>
-                          <Text variant="bodyMd">{isExpanded ? "▼" : "▶"}</Text>
-                        </InlineStack>
+                        </Button>
                       </Box>
 
-                      {isExpanded && (
+                      <Collapsible
+                        open={isExpanded}
+                        id={`collapsible-${group.key}`}
+                        transition={{ duration: "200ms", timingFunction: "ease-in-out" }}
+                      >
                         <Box paddingInline="400" paddingBlockEnd="400">
                           <BlockStack gap="300">
                             {selectedAccessories.length === 0 && (
@@ -1974,7 +1982,7 @@ export default function Index() {
                             )}
                           </BlockStack>
                         </Box>
-                      )}
+                      </Collapsible>
                     </BlockStack>
                   </Card>
                 );
