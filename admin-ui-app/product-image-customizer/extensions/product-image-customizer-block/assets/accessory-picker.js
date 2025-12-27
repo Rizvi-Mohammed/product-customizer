@@ -950,6 +950,65 @@
         renderSummary(hydratedSelections);
       };
 
+      const updateFormProperties = (selections = []) => {
+        const addToCartForms = document.querySelectorAll('form[action*="/cart/add"]');
+        if (!addToCartForms.length) return;
+
+        // Remove any existing accessory property inputs from all forms
+        addToCartForms.forEach(form => {
+          form.querySelectorAll('.accessory-bundle-prop').forEach(el => el.remove());
+        });
+
+        if (!selections || selections.length === 0) return;
+
+        // Generate bundle group ID (same format as addBundleViaAjax)
+        const bundleGroupId = `bundle-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        // Add bundle properties to ALL product forms
+        addToCartForms.forEach(addToCartForm => {
+          // Add bundle properties to the base product (parent role)
+          const bundleGroupInput = document.createElement("input");
+          bundleGroupInput.type = "hidden";
+          bundleGroupInput.className = "accessory-bundle-prop";
+          bundleGroupInput.name = "properties[_bundleGroupId]";
+          bundleGroupInput.value = bundleGroupId;
+          addToCartForm.appendChild(bundleGroupInput);
+
+          const bundleRoleInput = document.createElement("input");
+          bundleRoleInput.type = "hidden";
+          bundleRoleInput.className = "accessory-bundle-prop";
+          bundleRoleInput.name = "properties[_bundleRole]";
+          bundleRoleInput.value = "parent";
+          addToCartForm.appendChild(bundleRoleInput);
+
+          const bundleSizeInput = document.createElement("input");
+          bundleSizeInput.type = "hidden";
+          bundleSizeInput.className = "accessory-bundle-prop";
+          bundleSizeInput.name = "properties[Bundle Size]";
+          bundleSizeInput.value = String(selections.length + 1);
+          addToCartForm.appendChild(bundleSizeInput);
+
+          // Add display properties for each accessory
+          selections.forEach((sel, idx) => {
+            const categoryLabel = sel.categoryLabel || `Accessory ${idx + 1}`;
+            const labelParts = [sel.title];
+            if (sel.variantTitle) labelParts.push(sel.variantTitle);
+            const displayLabel = labelParts.filter(Boolean).join(" - ");
+
+            const propInput = document.createElement("input");
+            propInput.type = "hidden";
+            propInput.className = "accessory-bundle-prop";
+            propInput.name = `properties[Add ${categoryLabel}]`;
+            propInput.value = displayLabel;
+            addToCartForm.appendChild(propInput);
+          });
+
+          // Store bundle data in a data attribute for components to reference
+          addToCartForm.dataset.bundleGroupId = bundleGroupId;
+          addToCartForm.dataset.bundleSelections = JSON.stringify(selections);
+        });
+      };
+
       const applySelections = () => {
         const colorVal = normalizeColor(
           document.querySelector('select[name^="options["][name*="color" i]')?.value ||
@@ -975,6 +1034,7 @@
         if (totalsContainer) {
           updateTotals(baseVariantId, selections);
         }
+        updateFormProperties(selections);
       };
 
       picker.querySelectorAll("[data-accessory-variant-select]").forEach((select) => {
@@ -1119,7 +1179,7 @@
         if (!items.length) return;
 
         const root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || "/";
-        const cartAddUrl = `${root}cart/add.js`;
+        const cartAddUrl = `${root}cart/add`;
 
         try {
           const response = await fetch(cartAddUrl, {
@@ -1163,57 +1223,208 @@
         });
       }
 
-      // Intercept the theme's add to cart button/form
-      const addToCartForm = document.querySelector('form[action*="/cart/add"]');
-      if (addToCartForm) {
+      // Intercept form submission - SINGLE reliable handler per Shopify best practices
+      let globalIsAddingAccessories = false;
+      const addToCartForms = document.querySelectorAll('form[action*="/cart/add"]');
+      let handlerAttached = false;
 
-        const submitHandler = (event) => {
-          // Get current selections
-          const currentSelections = getAllSelections();
-          const hasSelections = (currentSelections || []).length > 0;
-          const bundleProductHandle = picker.getAttribute("data-bundle-product-handle") || "";
-          const useBundleProduct = bundleProductHandle && bundleProductHandle.trim() !== "" && hasSelections;
+      addToCartForms.forEach(addToCartForm => {
+        // Only attach to forms with submit buttons (main product form)
+        if (handlerAttached) return;
+        if (!addToCartForm.querySelector('[type="submit"], [name="add"]')) return;
 
-          if (useBundleProduct || hasSelections) {
-            // Prevent default form submission
-            event.preventDefault();
-            event.stopPropagation();
-            event.stopImmediatePropagation();
+        // Prevent double-binding
+        if (addToCartForm.dataset.bundleHandlerAttached === 'true') return;
+        addToCartForm.dataset.bundleHandlerAttached = 'true';
+        handlerAttached = true;
 
-            // Use our bundle logic instead
-            addBundleViaAjax();
-            return false;
+        addToCartForm.addEventListener("submit", async (event) => {
+          const selections = getAllSelections();
+
+          if (!selections || selections.length === 0) {
+            return; // No accessories, let Dawn's handler run normally
           }
-          // If no accessories selected, let the form submit normally
-        };
 
-        // Listen on the form submit event with capture phase
-        addToCartForm.addEventListener("submit", submitHandler, { capture: true });
+          // We have accessories - take full control
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
 
-        // Also listen on button clicks to catch button-based adds
-        const addToCartButtons = document.querySelectorAll('[type="submit"][name="add"], button[name="add"], [data-add-to-cart], .product-form__submit, button.btn[type="submit"]');
+          const submitButton = addToCartForm.querySelector('[type="submit"], [name="add"]');
+          if (submitButton) submitButton.disabled = true;
 
-        addToCartButtons.forEach(button => {
-          button.addEventListener("click", (event) => {
-            // Get current selections
-            const currentSelections = getAllSelections();
-            const hasSelections = (currentSelections || []).length > 0;
-            const bundleProductHandle = picker.getAttribute("data-bundle-product-handle") || "";
-            const useBundleProduct = bundleProductHandle && bundleProductHandle.trim() !== "" && hasSelections;
-            if (useBundleProduct || hasSelections) {
-              event.preventDefault();
-              event.stopPropagation();
-              event.stopImmediatePropagation();
+          try {
+            // Get form data
+            const formData = new FormData(addToCartForm);
+            const variantId = formData.get('id');
+            const quantity = Math.max(1, parseInt(formData.get('quantity') || '1', 10));
+            const bundleGroupId = addToCartForm.dataset.bundleGroupId;
 
-              // Use our bundle logic instead
-              addBundleViaAjax();
-              return false;
+            if (!variantId || !bundleGroupId) {
+              throw new Error('Missing variant ID or bundle group ID');
             }
-          }, { capture: true });
-        });
-      } else {
-        console.log('❌ Could not find add to cart form');
-      }
+
+            // Build items array: ALL items in ONE request (Shopify best practice)
+            const items = [];
+
+            // Build display properties for parent
+            const displayProps = {};
+            selections.forEach((sel, idx) => {
+              const categoryLabel = sel.categoryLabel || `Accessory ${idx + 1}`;
+              const labelParts = [sel.title];
+              if (sel.variantTitle) labelParts.push(sel.variantTitle);
+              const displayLabel = labelParts.filter(Boolean).join(" - ");
+              displayProps[`Add ${categoryLabel}`] = displayLabel;
+            });
+
+            // Add parent product first
+            items.push({
+              id: Number(variantId) || variantId,
+              quantity,
+              properties: {
+                ...displayProps,
+                _bundleGroupId: bundleGroupId,
+                _bundleRole: "parent",
+                "Bundle Size": String(selections.length + 1),
+              },
+            });
+
+            // Add accessories as components
+            selections.forEach((sel) => {
+              items.push({
+                id: Number(sel.variantId) || sel.variantId,
+                quantity,
+                properties: {
+                  _bundleGroupId: bundleGroupId,
+                  _bundleRole: "component",
+                },
+              });
+            });
+
+            // SINGLE cart add with section rendering (Shopify best practice)
+            const root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || "/";
+            const response = await fetch(`${root}cart/add.js`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+              },
+              credentials: "same-origin",
+              body: JSON.stringify({
+                items,
+                sections: [
+                  'cart-icon-bubble',
+                  'cart-notification-product',
+                  'cart-notification-button',
+                ],
+                sections_url: window.location.pathname
+              }),
+            });
+
+            const responseData = await response.json();
+
+            if (!response.ok) {
+              const errorMessage = responseData?.message || responseData?.description || 'Could not add bundle to cart.';
+              alert(`Error: ${errorMessage}`);
+              submitButton.disabled = false;
+              return;
+            }
+
+            // Success! Now update UI (wrapped to prevent UI errors from breaking cart add)
+            try {
+              // Update cart UI using returned sections (theme-agnostic)
+              if (responseData.sections) {
+                Object.entries(responseData.sections).forEach(([sectionId, sectionHtml]) => {
+                  const parser = new DOMParser();
+                  const doc = parser.parseFromString(sectionHtml, 'text/html');
+                  const newSection = doc.getElementById(sectionId);
+
+                  if (newSection) {
+                    const currentSection = document.getElementById(sectionId);
+                    if (currentSection) {
+                      currentSection.replaceWith(newSection);
+                    }
+                  }
+                });
+              }
+
+              // Theme-agnostic cart UI refresh
+              // 1. Try Dawn's cart notification with renderContents
+              const cartNotification = document.querySelector('cart-notification');
+              if (cartNotification) {
+                if (typeof cartNotification.renderContents === 'function') {
+                  // Dawn's preferred method - pass the response data
+                  cartNotification.renderContents(responseData);
+                } else if (typeof cartNotification.open === 'function') {
+                  // Fallback to just opening (sections already replaced above)
+                  cartNotification.open();
+                }
+              }
+
+              // 2. Try cart drawer (various themes)
+              const cartDrawer = document.querySelector('cart-drawer, [data-cart-drawer], #cart-drawer');
+              if (cartDrawer) {
+                if (typeof cartDrawer.open === 'function') {
+                  cartDrawer.open();
+                } else {
+                  cartDrawer.classList.add('active', 'is-open', 'open');
+                  cartDrawer.setAttribute('aria-hidden', 'false');
+                }
+              }
+
+              // 3. Update cart count badges (universal)
+              fetch((window.Shopify?.routes?.root || '/') + 'cart.js')
+                .then(res => res.json())
+                .then(cart => {
+                  const selectors = [
+                    '[data-cart-count]',
+                    '.cart-count',
+                    '.cart-count-bubble',
+                    '#cart-count',
+                    '.header__cart-count'
+                  ];
+                  selectors.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => {
+                      el.textContent = cart.item_count;
+                      if (cart.item_count > 0) {
+                        el.classList.remove('hidden', 'hide');
+                        el.style.display = '';
+                      }
+                    });
+                  });
+                })
+                .catch(() => { }); // Silent fail for cart count
+
+              // 4. Dispatch universal events for theme customizations
+              document.dispatchEvent(new CustomEvent('cart:updated', {
+                detail: { cart: responseData, source: 'bundle-add' }
+              }));
+              document.dispatchEvent(new CustomEvent('bundle:cart-updated', {
+                detail: { sections: responseData.sections, cart: responseData }
+              }));
+
+              // 5. Fallback: if no cart UI found, redirect to cart page
+              setTimeout(() => {
+                if (!cartNotification && !cartDrawer) {
+                  window.location.href = '/cart';
+                }
+              }, 100);
+
+            } catch (uiError) {
+              // Cart add succeeded but UI update failed - not critical
+              console.warn("Cart add succeeded but UI update had an issue:", uiError);
+              // Still show some feedback - reload page or redirect to cart
+              window.location.href = '/cart';
+            }
+
+          } catch (err) {
+            console.error("Failed to add bundle:", err);
+            alert('Sorry, could not add bundle. Please try again.');
+          } finally {
+            submitButton.disabled = false;
+          }
+        }, { capture: true }); // CRITICAL: Use capture phase to run BEFORE Dawn's handler
+      });
 
       document.addEventListener("variant:changed", reapply);
       document.addEventListener("product:variant-change", reapply);

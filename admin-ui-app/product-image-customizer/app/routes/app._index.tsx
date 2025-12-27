@@ -15,18 +15,18 @@ import {
   Thumbnail,
   Divider,
   Tag,
-  Popover,
-  OptionList,
   TextField,
-  Scrollable,
   Collapsible,
   Spinner,
   Icon,
+  Checkbox,
 } from "@shopify/polaris";
 import {
   ProductIcon,
   CollectionIcon,
   ImageIcon,
+  ChevronUpIcon,
+  ChevronDownIcon,
 } from "@shopify/polaris-icons";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -80,6 +80,11 @@ type ColorImageMap = Record<
       combinationKey?: string;
       accessoryIds?: string[];
       variantIds?: string[];
+      // Name-based matching metadata
+      baseOptionName?: string;
+      baseOptionValue?: string;
+      accessoryOptionName?: string;
+      accessoryOptionValue?: string;
     }
   >
 >; // baseColorKey -> accessoryProductId
@@ -94,6 +99,11 @@ type VariantImageMap = Record<
       baseColor?: string;
       accessoryProductId?: string;
       variantId?: string;
+      // Name-based matching metadata
+      baseOptionName?: string;
+      baseOptionValue?: string;
+      accessoryOptionName?: string;
+      accessoryOptionValue?: string;
     }
   >
 >; // baseVariantId -> accessoryProductId -> payload
@@ -143,6 +153,58 @@ const groupVariantsByColor = (product?: ProductNode | null): ColorGroup[] => {
   });
 
   return Object.values(groups);
+};
+
+const groupVariantsByOption = (product?: ProductNode | null, optionName?: string): ColorGroup[] => {
+  if (!product?.variants?.edges?.length) return [];
+
+  // If "none" is selected, each variant is its own group
+  if (optionName === "none") {
+    return product.variants.edges.map(({ node }) => ({
+      key: node.id,
+      label: node.title,
+      variants: [node],
+    }));
+  }
+
+  // If no option specified or "color", use color grouping
+  if (!optionName || optionName === "color") {
+    return groupVariantsByColor(product);
+  }
+
+  // Group by specified option
+  const groups: Record<string, ColorGroup> = {};
+  product.variants.edges.forEach(({ node }) => {
+    const optionValue = node.selectedOptions?.find((o) =>
+      o.name.toLowerCase() === optionName.toLowerCase()
+    )?.value || "Default";
+    const key = normalizeColor(optionValue);
+    if (!groups[key]) {
+      groups[key] = { key, label: optionValue, variants: [] };
+    }
+    groups[key].variants.push(node);
+  });
+
+  return Object.values(groups);
+};
+
+const getGroupingOptionFromVariant = (variant: VariantNode, groupingOption: string) => {
+  if (!variant.selectedOptions?.length) return { name: null, value: null };
+
+  if (groupingOption === "none" || groupingOption === "color") {
+    // Try to find color option
+    const colorOpt = variant.selectedOptions.find(o => /color|colour/i.test(o.name));
+    if (colorOpt) return { name: colorOpt.name, value: colorOpt.value };
+    // Fallback to first option
+    const first = variant.selectedOptions[0];
+    return { name: first.name, value: first.value };
+  }
+
+  // Find the specific option by name
+  const match = variant.selectedOptions.find(o =>
+    o.name.toLowerCase() === groupingOption.toLowerCase()
+  );
+  return match ? { name: match.name, value: match.value } : { name: null, value: null };
 };
 
 const STAGED_UPLOAD_MUTATION = `#graphql
@@ -247,7 +309,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       const ensure = await admin.graphql(CREATE_RULESET_DEFINITION);
       const ensureJson = await ensure.json();
       const ensureErrors =
-        ensureJson?.data?.metaobjectDefinitionCreate?.userErrors || ensureJson?.errors;
+        ensureJson?.data?.metaobjectDefinitionCreate?.userErrors || (ensureJson as any)?.errors;
       if (Array.isArray(ensureErrors)) {
         const duplicate = ensureErrors.some(
           (err: any) => (err?.message || "").toLowerCase().includes("already been taken"),
@@ -369,7 +431,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
     const jsonResp = await upsertResp.json();
     const mo = jsonResp?.data?.metaobjectUpsert?.metaobject;
-    const errors = jsonResp?.data?.metaobjectUpsert?.userErrors || jsonResp?.errors;
+    const errors = jsonResp?.data?.metaobjectUpsert?.userErrors || (jsonResp as any)?.errors;
 
     if (errors && errors.length > 0) {
       console.error("❌ Create ruleset errors:", JSON.stringify(errors, null, 2));
@@ -390,7 +452,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!rulesetId) return json({ error: "Missing rulesetId" }, { status: 400 });
     const delResp = await admin.graphql(RULESET_DELETE_MUTATION, { variables: { id: rulesetId } });
     const delJson = await delResp.json();
-    const err = delJson?.data?.metaobjectDelete?.userErrors || delJson?.errors;
+    const err = delJson?.data?.metaobjectDelete?.userErrors || (delJson as any)?.errors;
     if (err?.length) return json({ error: "Delete failed", details: err }, { status: 400 });
     return json({ ok: true, deletedId: rulesetId });
   }
@@ -479,6 +541,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const accessoryVariantId = formData.get("accessoryVariantId") as string | null;
     const combinationKey = formData.get("combinationKey") as string | null;
     const combinationMetaRaw = formData.get("combinationMeta") as string | null;
+    const baseOptionName = formData.get("baseOptionName") as string | null;
+    const baseOptionValue = formData.get("baseOptionValue") as string | null;
+    const accessoryOptionName = formData.get("accessoryOptionName") as string | null;
+    const accessoryOptionValue = formData.get("accessoryOptionValue") as string | null;
     let combinationMeta = null;
     if (combinationMetaRaw) {
       try {
@@ -571,6 +637,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       combinationMeta,
       fileId: created.id,
       fileUrl,
+      baseOptionName,
+      baseOptionValue,
+      accessoryOptionName,
+      accessoryOptionValue,
     });
   }
 
@@ -613,6 +683,41 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  if (actionType === "clear_mappings") {
+    const rulesetId = formData.get("rulesetId") as string | null;
+    const handle = (formData.get("handle") as string) || "";
+
+    if (!rulesetId) return json({ error: "Missing rulesetId" }, { status: 400 });
+
+    try {
+      const handleValue = handle || slugify(rulesetId);
+      const upsertResp = await admin.graphql(RULESET_UPSERT_MUTATION, {
+        variables: {
+          handle: { type: "pic_ruleset", handle: handleValue },
+          metaobject: {
+            handle: handleValue,
+            fields: [
+              { key: "color_map", value: JSON.stringify({}) },
+              { key: "variant_map", value: JSON.stringify({}) },
+            ],
+          },
+        },
+      });
+      const upsertJson = await upsertResp.json();
+      const mo = upsertJson?.data?.metaobjectUpsert?.metaobject;
+      if (!mo?.id) return json({ error: "Clear failed", details: upsertJson }, { status: 400 });
+      return json({
+        ok: true,
+        rulesetId: mo.id,
+        handle: mo.handle,
+        lastAction: "clear_mappings",
+      });
+    } catch (e) {
+      console.error("Clear mappings failed", e);
+      return json({ error: "Clear failed" }, { status: 400 });
+    }
+  }
+
   if (actionType === "link_product_to_ruleset") {
     const productId = formData.get("productId") as string;
     const rulesetId = formData.get("rulesetId") as string;
@@ -648,31 +753,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Index() {
-  const { products, rulesets, error } = useLoaderData<typeof loader>();
+  const loaderData = useLoaderData<typeof loader>();
+  const { products, error } = loaderData;
+  const rulesets = 'rulesets' in loaderData ? loaderData.rulesets : [];
   const fetcher = useFetcher<typeof action>();
   const uploadFetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
 
   const [rulesetList, setRulesetList] = useState<Ruleset[]>(rulesets || []);
-  const initialProductId = products[0]?.id || "";
   const [selectedRulesetId, setSelectedRulesetId] = useState<string>("");
   const [selectedRulesetHandle, setSelectedRulesetHandle] = useState<string>("");
   const [selectedRulesetName, setSelectedRulesetName] = useState<string>("Untitled ruleset");
-  const [selectedProductId, setSelectedProductId] = useState<string>(initialProductId);
+  const [selectedProductId, setSelectedProductId] = useState<string>("");
   const [selectedBaseProducts, setSelectedBaseProducts] = useState<string[]>([]);
   const [selectedAccessories, setSelectedAccessories] = useState<string[]>([]);
   const [ruleCategories, setRuleCategories] = useState<RuleCategory[]>([]);
   const [accessoryCategories, setAccessoryCategories] = useState<AccessoryCategoryMap>({});
   const [accessoryVariantSelection, setAccessoryVariantSelection] = useState<Record<string, string[]>>({});
-  const [accessorySearch, setAccessorySearch] = useState("");
   const [step, setStep] = useState<"list" | "configure" | "mappings">("list");
   const [colorImageMap, setColorImageMap] = useState<ColorImageMap>({});
   const [colorImageMapByBase, setColorImageMapByBase] = useState<Record<string, ColorImageMap>>({});
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [mappingMode, setMappingMode] = useState<"show_all" | "create_specific">("create_specific");
-  const [selectedBaseVariantId, setSelectedBaseVariantId] = useState<string>("");
+  const [baseGroupingEnabled, setBaseGroupingEnabled] = useState<boolean>(true);
+  const [variantGroupingMode, setVariantGroupingMode] = useState<string>("color"); // "color", "size", "none", or any option name
+  const [accessoryGroupingModes, setAccessoryGroupingModes] = useState<Record<string, { enabled: boolean; option: string }>>({});
+  const [selectedBaseColorKey, setSelectedBaseColorKey] = useState<string>("");
   const [selectedMappingAccessories, setSelectedMappingAccessories] = useState<string[]>([]);
-  const [openBaseProductPicker, setOpenBaseProductPicker] = useState(false);
   const uploadInFlight = uploadFetcher.state !== "idle";
   const uploadError = (uploadFetcher.data as any)?.error;
   // Derive upload state directly from fetcher for better Polaris compliance
@@ -681,14 +788,39 @@ export default function Index() {
     : null;
 
   const selectedProduct = useMemo(
-    () => products.find((p: ProductNode) => p.id === selectedProductId),
+    () => products.find((p) => p?.id === selectedProductId) || null,
     [products, selectedProductId],
   );
 
-  const baseColorGroups = useMemo(() => groupVariantsByColor(selectedProduct), [selectedProduct]);
+  const baseColorGroups = useMemo(
+    () => groupVariantsByOption(selectedProduct, baseGroupingEnabled ? variantGroupingMode : "none"),
+    [selectedProduct, baseGroupingEnabled, variantGroupingMode]
+  );
+
+  // Get available variant options for any product
+  const getAvailableOptions = useCallback((product?: ProductNode | null) => {
+    if (!product?.options?.length) return [];
+    return product.options.map(opt => ({
+      label: opt.name,
+      value: opt.name.toLowerCase(),
+    }));
+  }, []);
+
+  const availableVariantOptions = useMemo(() =>
+    getAvailableOptions(selectedProduct),
+    [selectedProduct, getAvailableOptions]
+  );
+
+  // Get grouped variants for an accessory product
+  const getAccessoryGroups = useCallback((accessoryId: string) => {
+    const product = products.find(p => p?.id === accessoryId) || null;
+    const grouping = accessoryGroupingModes[accessoryId];
+    const optionName = grouping?.enabled ? (grouping.option || "color") : "none";
+    return groupVariantsByOption(product, optionName);
+  }, [products, accessoryGroupingModes]);
 
   const accessoryProducts = useMemo(
-    () => products.filter((p: ProductNode) => selectedAccessories.includes(p.id)),
+    () => products.filter((p) => p && selectedAccessories.includes(p.id)),
     [products, selectedAccessories],
   );
 
@@ -712,7 +844,7 @@ export default function Index() {
         .map((group) => {
           const variants: CategoryVariantOption[] = [];
           group.accessoryIds.forEach((accId) => {
-            const prod = products.find((p) => p.id === accId);
+            const prod = products.find((p) => p?.id === accId);
             const prodVariants = prod?.variants?.edges?.map((edge) => edge.node) || [];
             if (prodVariants.length === 0) {
               variants.push({
@@ -763,7 +895,7 @@ export default function Index() {
     (accessoryId: string) => {
       const selected = accessoryVariantSelection[accessoryId];
       if (selected?.length) return selected;
-      const prod = products.find((p) => p.id === accessoryId);
+      const prod = products.find((p) => p?.id === accessoryId);
       const allVariants = prod?.variants?.edges?.map((edge) => edge.node.id) || [];
       return allVariants.length ? allVariants : [accessoryId];
     },
@@ -772,7 +904,7 @@ export default function Index() {
 
   const resolveAccessoryVariantTitle = useCallback(
     (accessoryId: string, variantId: string) => {
-      const prod = products.find((p) => p.id === accessoryId);
+      const prod = products.find((p) => p?.id === accessoryId);
       const match = prod?.variants?.edges?.find((edge) => edge.node.id === variantId)?.node;
       return match?.title || "Variant";
     },
@@ -780,18 +912,18 @@ export default function Index() {
   );
 
   const productOptions = useMemo(
-    () => products.map((p: ProductNode) => ({ label: p.title, value: p.id })),
+    () => products.filter((p): p is ProductNode => p !== null).map((p) => ({ label: p.title, value: p.id })),
     [products],
   );
 
   // Keep selection valid if products change.
   useEffect(() => {
-    if (!selectedProductId && products.length > 0) {
+    if (!selectedProductId && products.length > 0 && products[0]) {
       setSelectedProductId(products[0].id);
       return;
     }
-    const stillExists = products.some((p) => p.id === selectedProductId);
-    if (!stillExists && products.length > 0) {
+    const stillExists = products.some((p) => p?.id === selectedProductId);
+    if (!stillExists && products.length > 0 && products[0]) {
       setSelectedProductId(products[0].id);
     }
   }, [products, selectedProductId]);
@@ -801,7 +933,7 @@ export default function Index() {
       if (!rulesets?.length) return prev;
       if (!prev.length) return rulesets;
       // Merge loader data with local state, preserving local maps/categories/base products when loader is stale.
-      return rulesets.map((r) => {
+      return rulesets.map((r: Ruleset) => {
         const local = prev.find((p) => p.id === r.id);
         if (!local) return r;
         return {
@@ -868,16 +1000,6 @@ export default function Index() {
     setColorImageMap(colorImageMapByBase[selectedProductId] || {});
   }, [selectedProductId, colorImageMapByBase]);
 
-  useEffect(() => {
-    if (!selectedProductId) return;
-    setSelectedBaseProducts((prev) =>
-      prev.includes(selectedProductId) ? prev : [...prev, selectedProductId],
-    );
-  }, [selectedProductId]);
-  useEffect(() => {
-    setAccessorySearch("");
-  }, [selectedProductId]);
-
   // Keep accessory-variant selections in sync with accessory choices
   useEffect(() => {
     setAccessoryVariantSelection((prev) => {
@@ -891,7 +1013,7 @@ export default function Index() {
       // Ensure defaults for new accessories
       selectedAccessories.forEach((id) => {
         if (!next[id]) {
-          const prod = products.find((p) => p.id === id);
+          const prod = products.find((p) => p?.id === id);
           const variants = prod?.variants?.edges?.map((edge) => edge.node.id) || [];
           next[id] = variants.length ? variants : [id];
         }
@@ -949,6 +1071,7 @@ export default function Index() {
               id: data.rulesetId,
               handle: data.handle || data.rulesetId,
               name: data.name || "Ruleset",
+              accessories: [],
               ...nextPayload,
             },
           ];
@@ -960,6 +1083,20 @@ export default function Index() {
         // Don't navigate - the button handler will do it
       } else if (lastAction === "create_ruleset") {
         setStep("configure");
+      } else if (lastAction === "clear_mappings") {
+        // Clear local state
+        setColorImageMap({});
+        setColorImageMapByBase({});
+        setSelectedBaseColorKey("");
+        setSelectedMappingAccessories([]);
+        // Update ruleset list
+        setRulesetList((prev) =>
+          prev.map((r) =>
+            r.id === data.rulesetId
+              ? { ...r, colorMapByBase: {}, variantMapByBase: {} }
+              : r
+          )
+        );
       }
     }
     if (data?.deletedId) {
@@ -979,7 +1116,7 @@ export default function Index() {
       });
       selectedAccessories.forEach((id) => {
         if (!next[id]) {
-          const prod = products.find((p) => p.id === id);
+          const prod = products.find((p) => p?.id === id);
           next[id] = prod?.title || "Accessories";
         }
       });
@@ -1004,11 +1141,17 @@ export default function Index() {
           combinationKey: combinationKey || undefined,
           accessoryIds: combinationMeta.accessoryIds,
           variantIds: combinationMeta.variantIds,
+          baseOptionName: data.baseOptionName,
+          baseOptionValue: data.baseOptionValue,
+          accessoryOptionName: data.accessoryOptionName,
+          accessoryOptionValue: data.accessoryOptionValue,
         };
         if (combinationKey) {
           next[colorKey][combinationKey] = payload;
         } else {
-          const key = data.accessoryVariantId || data.accessoryId;
+          // Use accessory product ID as key for group-level mappings
+          // This allows the mapping to apply to all variants in the group
+          const key = data.accessoryId;
           next[colorKey][key] = payload;
         }
         setColorImageMapByBase((prevMaps) => ({
@@ -1038,7 +1181,15 @@ export default function Index() {
     accessoryProductId: string,
     accessoryVariantId: string,
     file: File | null,
-    options?: { combinationKey?: string; accessoryIds?: string[]; variantIds?: string[] },
+    options?: {
+      combinationKey?: string;
+      accessoryIds?: string[];
+      variantIds?: string[];
+      baseOptionName?: string;
+      baseOptionValue?: string;
+      accessoryOptionName?: string;
+      accessoryOptionValue?: string;
+    },
   ) => {
     if (!selectedProductId) return;
     if (!file) {
@@ -1076,6 +1227,11 @@ export default function Index() {
         }),
       );
     }
+    // Add option metadata for name-based matching
+    if (options?.baseOptionName) fd.append("baseOptionName", options.baseOptionName);
+    if (options?.baseOptionValue) fd.append("baseOptionValue", options.baseOptionValue);
+    if (options?.accessoryOptionName) fd.append("accessoryOptionName", options.accessoryOptionName);
+    if (options?.accessoryOptionValue) fd.append("accessoryOptionValue", options.accessoryOptionValue);
     fd.append("file", file);
     uploadFetcher.submit(fd, { method: "post", encType: "multipart/form-data" });
   };
@@ -1107,26 +1263,57 @@ export default function Index() {
           ...entry,
           accessoryProductId: entry.accessoryProductId || key,
           variantId: entry.variantId || key,
+          baseOptionName: entry.baseOptionName,
+          baseOptionValue: entry.baseOptionValue,
+          accessoryOptionName: entry.accessoryOptionName,
+          accessoryOptionValue: entry.accessoryOptionValue,
         };
 
         if (!colorMapToSave[baseGroup.key]) colorMapToSave[baseGroup.key] = {};
         colorMapToSave[baseGroup.key][key] = payload;
 
-        // Normalize accessory variant keys (both GID and numeric)
-        const accessoryKeys = [key, toNumericId(key)].filter(Boolean);
+        // Find ALL accessory variants that match the option criteria
+        let accessoryVariantIds: string[] = [];
 
+        if (entry.accessoryOptionName && entry.accessoryOptionValue && entry.accessoryProductId) {
+          // Option-based matching: find all variants with matching option value
+          const accProduct = products.find(p => p?.id === entry.accessoryProductId);
+          if (accProduct?.variants?.edges) {
+            accessoryVariantIds = accProduct.variants.edges
+              .map(({ node }) => {
+                const optMatch = node.selectedOptions?.find(opt =>
+                  opt.name === entry.accessoryOptionName &&
+                  opt.value === entry.accessoryOptionValue
+                );
+                return optMatch ? node.id : null;
+              })
+              .filter((id): id is string => id !== null);
+          }
+        }
+
+        // Fallback to key-based matching if no option matching
+        if (accessoryVariantIds.length === 0) {
+          accessoryVariantIds = [key];
+        }
+
+        // Expand to all combinations: base variants × matching accessory variants
         baseGroup.variants.forEach((baseVariant) => {
           const baseKeys = [baseVariant.id, toNumericId(baseVariant.id)];
-          baseKeys.forEach((bKey) => {
-            if (!bKey) return;
-            if (!variantMap[bKey]) variantMap[bKey] = {};
 
-            // Store under both accessory GID and numeric ID
-            accessoryKeys.forEach((accKey) => {
-              variantMap[bKey][accKey] = {
-                ...payload,
-                baseColor: baseGroup.label,
-              };
+          accessoryVariantIds.forEach((accVariantId) => {
+            const accessoryKeys = [accVariantId, toNumericId(accVariantId)].filter(Boolean);
+
+            baseKeys.forEach((bKey) => {
+              if (!bKey) return;
+              if (!variantMap[bKey]) variantMap[bKey] = {};
+
+              // Store under both accessory GID and numeric ID
+              accessoryKeys.filter((k): k is string => k !== null && k !== undefined).forEach((accKey) => {
+                variantMap[bKey][accKey] = {
+                  ...payload,
+                  baseColor: baseGroup.label,
+                };
+              });
             });
           });
         });
@@ -1218,10 +1405,29 @@ export default function Index() {
                 {rulesetList.map((ruleset) => {
                   const baseCount = ruleset.baseProducts?.length || 0;
                   const catCount = ruleset.categories?.length || 0;
-                  const mappingCount = Object.values(ruleset.colorMapByBase || {}).reduce(
-                    (sum, group) => sum + Object.keys(group).length,
+
+                  // Debug: Log the colorMapByBase structure
+                  console.log(`📊 Ruleset "${ruleset.name}" colorMapByBase:`, JSON.stringify(ruleset.colorMapByBase, null, 2));
+
+                  // Count unique base color + accessory product combinations across ALL base products
+                  const mappingCount = Object.keys(ruleset.colorMapByBase || {}).reduce(
+                    (sum, baseProductId) => {
+                      const baseProductMappings = ruleset.colorMapByBase[baseProductId] || {};
+                      console.log(`  Base product ${baseProductId} has ${Object.keys(baseProductMappings).length} color groups`);
+                      Object.values(baseProductMappings).forEach((colorGroup: any) => {
+                        // Count unique accessory products per color group
+                        const uniqueAccessories = new Set(
+                          Object.values(colorGroup).map((m: any) => m.accessoryProductId).filter(Boolean)
+                        );
+                        console.log(`    Color group has ${uniqueAccessories.size} unique accessories:`, Array.from(uniqueAccessories));
+                        sum += uniqueAccessories.size;
+                      });
+                      return sum;
+                    },
                     0
                   );
+
+                  console.log(`📈 Total mapping count for "${ruleset.name}": ${mappingCount}`);
 
                   return (
                     <Card key={ruleset.id}>
@@ -1259,6 +1465,9 @@ export default function Index() {
                                 if (ruleset.baseProducts?.length) {
                                   setSelectedProductId(ruleset.baseProducts[0]);
                                 }
+                                // Clear selection state for fresh UX
+                                setSelectedBaseColorKey("");
+                                setSelectedMappingAccessories([]);
                                 setStep("mappings");
                               }}
                               disabled={!baseCount || !catCount}
@@ -1335,6 +1544,7 @@ export default function Index() {
                         type: 'product',
                         action: 'select',
                         multiple: true,
+                        selectionIds: selectedBaseProducts.map((id) => ({ id })),
                         filter: {
                           hidden: false,
                           variants: false,
@@ -1342,10 +1552,10 @@ export default function Index() {
                       });
                       if (selection && selection.length > 0) {
                         const newProductIds = selection.map((product: any) => product.id);
-                        const uniqueIds = Array.from(new Set([...selectedBaseProducts, ...newProductIds]));
-                        setSelectedBaseProducts(uniqueIds);
-                        if (!selectedProductId || !uniqueIds.includes(selectedProductId)) {
-                          setSelectedProductId(uniqueIds[0]);
+                        setSelectedBaseProducts(newProductIds);
+                        // Set the first selected product as the active one for mapping view
+                        if (!selectedProductId || !newProductIds.includes(selectedProductId)) {
+                          setSelectedProductId(newProductIds[0]);
                         }
                         if (!selectedRulesetName.trim() || selectedRulesetName === "New Ruleset" || selectedRulesetName === "Untitled ruleset") {
                           setSelectedRulesetName(`${selection[0].title} Ruleset`);
@@ -1366,6 +1576,7 @@ export default function Index() {
                               onRemove={() => {
                                 const newProducts = selectedBaseProducts.filter((p) => p !== pid);
                                 setSelectedBaseProducts(newProducts);
+                                // If removing the currently selected product, switch to another or clear
                                 if (selectedProductId === pid) {
                                   setSelectedProductId(newProducts[0] || "");
                                 }
@@ -1378,6 +1589,8 @@ export default function Index() {
                       </InlineStack>
                       <Button
                         size="slim"
+                        variant="plain"
+                        tone="critical"
                         onClick={() => {
                           setSelectedBaseProducts([]);
                           setSelectedProductId("");
@@ -1440,38 +1653,32 @@ export default function Index() {
                                 />
                               </Box>
                               <InlineStack gap="200">
-                                <Popover
-                                  active={cat.id === accessorySearch}
-                                  activator={
-                                    <Button
-                                      disclosure
-                                      onClick={() => setAccessorySearch(cat.id)}
-                                    >
-                                      {cat.productIds.length
-                                        ? `${cat.productIds.length} product${cat.productIds.length !== 1 ? 's' : ''}`
-                                        : "Select products"}
-                                    </Button>
-                                  }
-                                  onClose={() => setAccessorySearch("")}
-                                  autofocusTarget="first-node"
+                                <Button
+                                  onClick={async () => {
+                                    const selection = await shopify.resourcePicker({
+                                      type: 'product',
+                                      action: 'select',
+                                      multiple: true,
+                                      selectionIds: cat.productIds.map((id) => ({ id })),
+                                      filter: {
+                                        hidden: false,
+                                        variants: false,
+                                      },
+                                    });
+                                    if (selection && selection.length > 0) {
+                                      const newProductIds = selection.map((product: any) => product.id);
+                                      setRuleCategories((prev) =>
+                                        prev.map((c) =>
+                                          c.id === cat.id ? { ...c, productIds: newProductIds } : c,
+                                        ),
+                                      );
+                                    }
+                                  }}
                                 >
-                                  <Box padding="300" minWidth="320px">
-                                    <Scrollable style={{ maxHeight: "280px" }} shadow>
-                                      <OptionList
-                                        options={productOptions}
-                                        selected={cat.productIds}
-                                        onChange={(value) =>
-                                          setRuleCategories((prev) =>
-                                            prev.map((c) =>
-                                              c.id === cat.id ? { ...c, productIds: value as string[] } : c,
-                                            ),
-                                          )
-                                        }
-                                        allowMultiple
-                                      />
-                                    </Scrollable>
-                                  </Box>
-                                </Popover>
+                                  {cat.productIds.length
+                                    ? `${cat.productIds.length} product${cat.productIds.length !== 1 ? 's' : ''}`
+                                    : "Select products"}
+                                </Button>
                                 <Button
                                   tone="critical"
                                   onClick={() =>
@@ -1561,6 +1768,20 @@ export default function Index() {
                   </Text>
                 </BlockStack>
                 <InlineStack gap="200">
+                  <Button
+                    tone="critical"
+                    onClick={() => {
+                      if (confirm("Are you sure you want to clear all image mappings? This cannot be undone.")) {
+                        const fd = new FormData();
+                        fd.append("action", "clear_mappings");
+                        fd.append("rulesetId", selectedRulesetId);
+                        if (selectedRulesetHandle) fd.append("handle", selectedRulesetHandle);
+                        fetcher.submit(fd, { method: "post" });
+                      }
+                    }}
+                  >
+                    Clear all mappings
+                  </Button>
                   <Select
                     label="Base product"
                     labelHidden
@@ -1571,7 +1792,11 @@ export default function Index() {
                     value={selectedProductId}
                     onChange={(val) => setSelectedProductId(val)}
                   />
-                  <Button onClick={() => setStep("configure")}>Back to configuration</Button>
+                  <Button onClick={() => {
+                    setSelectedBaseColorKey("");
+                    setSelectedMappingAccessories([]);
+                    setStep("configure");
+                  }}>Back to configuration</Button>
                 </InlineStack>
               </InlineStack>
 
@@ -1610,61 +1835,166 @@ export default function Index() {
 
               {mappingMode === "create_specific" && (
                 <Card>
-                  <BlockStack gap="300">
+                  <BlockStack gap="400">
                     <Text as="h3" variant="headingMd">Create new mapping</Text>
 
-                    <Select
-                      label="Select base product variant"
-                      options={baseColorGroups.flatMap((group) =>
-                        group.variants.map((variant) => ({
-                          label: `${group.label} - ${variant.title}`,
-                          value: variant.id,
-                        }))
+                    <Divider />
+
+                    <BlockStack gap="300">
+                      <InlineStack align="space-between" blockAlign="center">
+                        <BlockStack gap="100">
+                          <Text as="p" variant="bodyMd" fontWeight="semibold">Base product grouping</Text>
+                          <Text as="p" tone="subdued" variant="bodySm">
+                            Group variants to create fewer mappings
+                          </Text>
+                        </BlockStack>
+                        <Checkbox
+                          label="Group variants"
+                          checked={baseGroupingEnabled}
+                          onChange={(checked) => {
+                            setBaseGroupingEnabled(checked);
+                            setSelectedBaseColorKey("");
+                          }}
+                        />
+                      </InlineStack>
+                      {baseGroupingEnabled && availableVariantOptions.length > 0 && (
+                        <Select
+                          label="Group by"
+                          options={availableVariantOptions}
+                          value={variantGroupingMode}
+                          onChange={(value) => {
+                            setVariantGroupingMode(value);
+                            setSelectedBaseColorKey("");
+                          }}
+                        />
                       )}
-                      value={selectedBaseVariantId}
-                      onChange={setSelectedBaseVariantId}
-                      placeholder="Choose a variant"
+                    </BlockStack>
+
+                    <Divider />
+
+                    <Select
+                      label={baseGroupingEnabled
+                        ? `Select base product ${availableVariantOptions.find(o => o.value === variantGroupingMode)?.label || "group"}`
+                        : "Select base product variant"
+                      }
+                      options={baseColorGroups.map((group) => ({
+                        label: group.variants.length === 1
+                          ? group.label
+                          : `${group.label} (${group.variants.length} variant${group.variants.length !== 1 ? 's' : ''})`,
+                        value: group.key,
+                      }))}
+                      value={selectedBaseColorKey}
+                      onChange={setSelectedBaseColorKey}
+                      placeholder={baseGroupingEnabled ? "Choose a group" : "Choose a variant"}
                     />
 
-                    {selectedBaseVariantId && (
+                    {selectedBaseColorKey && (
                       <>
                         <Divider />
-                        <Text as="p" variant="bodyMd">Select accessory variant(s)</Text>
+
+                        <Text as="p" variant="bodyMd" fontWeight="semibold">Select accessories and configure mappings</Text>
+                        {accessoryProducts.length === 0 ? (
+                          <Banner tone="info">
+                            <p>No accessories configured yet. Add accessories in the configuration step.</p>
+                          </Banner>
+                        ) : (
+                          <Text as="p" tone="subdued" variant="bodySm">
+                            Choose grouping options and select variants for each accessory
+                          </Text>
+                        )}
                         <BlockStack gap="200">
                           {selectedAccessories.map((accId) => {
-                            const accProduct = accessoryProducts.find((p) => p.id === accId);
-                            const variantIds = resolveAccessoryVariantIds(accId);
+                            const accProduct = accessoryProducts.find((p) => p?.id === accId);
+                            const accOptions = getAvailableOptions(accProduct);
+                            const grouping = accessoryGroupingModes[accId] || { enabled: false, option: "color" };
+                            const accGroups = getAccessoryGroups(accId);
 
                             return (
-                              <Box key={accId} padding="300" borderColor="border-subdued" borderWidth="025" borderRadius="200">
-                                <BlockStack gap="200">
+                              <Box key={accId} padding="300" borderColor="border" borderWidth="025" borderRadius="200">
+                                <BlockStack gap="300">
                                   <InlineStack gap="150" blockAlign="center">
                                     <Thumbnail size="small" source={accProduct?.featuredImage?.url || ""} alt={accProduct?.title || "Accessory"} />
-                                    <Text as="p" variant="bodyMd">{accProduct?.title || "Accessory"}</Text>
+                                    <Text as="p" variant="bodyMd" fontWeight="semibold">{accProduct?.title || "Accessory"}</Text>
                                   </InlineStack>
 
+                                  {accOptions.length > 0 && (
+                                    <InlineStack gap="200" blockAlign="center">
+                                      <Checkbox
+                                        label="Group variants"
+                                        checked={grouping.enabled}
+                                        onChange={(checked) => {
+                                          setAccessoryGroupingModes((prev) => ({
+                                            ...prev,
+                                            [accId]: { ...prev[accId], enabled: checked, option: prev[accId]?.option || accOptions[0]?.value || "color" },
+                                          }));
+                                          // Clear selection for this accessory
+                                          const variantIds = resolveAccessoryVariantIds(accId);
+                                          setSelectedMappingAccessories((prev) =>
+                                            prev.filter((v) => !variantIds.includes(v))
+                                          );
+                                        }}
+                                      />
+                                      {grouping.enabled && (
+                                        <Select
+                                          label="Group by"
+                                          labelHidden
+                                          options={accOptions}
+                                          value={grouping.option}
+                                          onChange={(value) => {
+                                            setAccessoryGroupingModes((prev) => ({
+                                              ...prev,
+                                              [accId]: { ...prev[accId], option: value },
+                                            }));
+                                            // Clear selection for this accessory
+                                            const variantIds = resolveAccessoryVariantIds(accId);
+                                            setSelectedMappingAccessories((prev) =>
+                                              prev.filter((v) => !variantIds.includes(v))
+                                            );
+                                          }}
+                                        />
+                                      )}
+                                    </InlineStack>
+                                  )}
+
                                   <Select
-                                    label="Variant"
+                                    label={grouping.enabled ? `Select ${grouping.option} group` : "Select variant"}
                                     labelHidden
                                     options={[
-                                      { label: "Select a variant", value: "" },
-                                      ...variantIds.map((variantId) => ({
-                                        label: resolveAccessoryVariantTitle(accId, variantId),
-                                        value: variantId,
+                                      { label: grouping.enabled ? "Select a group" : "Select a variant", value: "" },
+                                      ...accGroups.map((group) => ({
+                                        label: group.variants.length === 1
+                                          ? group.label
+                                          : `${group.label} (${group.variants.length} variant${group.variants.length !== 1 ? 's' : ''})`,
+                                        value: group.key,
                                       })),
                                     ]}
-                                    value={selectedMappingAccessories.find((v) => variantIds.includes(v)) || ""}
+                                    value={(() => {
+                                      // Find which group contains any selected variant for this accessory
+                                      const selectedForThisAcc = selectedMappingAccessories.filter((v) => {
+                                        return accGroups.some((g) => g.variants.some((variant) => variant.id === v));
+                                      });
+                                      if (selectedForThisAcc.length === 0) return "";
+                                      // Find the group that contains the selected variant
+                                      const matchingGroup = accGroups.find((g) =>
+                                        g.variants.some((v) => selectedForThisAcc.includes(v.id))
+                                      );
+                                      return matchingGroup?.key || "";
+                                    })()}
                                     onChange={(val) => {
-                                      if (!val) {
-                                        setSelectedMappingAccessories((prev) =>
-                                          prev.filter((v) => !variantIds.includes(v))
-                                        );
-                                      } else {
-                                        setSelectedMappingAccessories((prev) => {
-                                          const filtered = prev.filter((v) => !variantIds.includes(v));
-                                          return [...filtered, val];
-                                        });
+                                      // Remove all variants from this accessory first
+                                      const allVariantIds = accGroups.flatMap((g) => g.variants.map((v) => v.id));
+                                      let filtered = selectedMappingAccessories.filter((v) => !allVariantIds.includes(v));
+
+                                      if (val) {
+                                        // Add representation of this group selection
+                                        const selectedGroup = accGroups.find((g) => g.key === val);
+                                        if (selectedGroup && selectedGroup.variants.length > 0) {
+                                          // Store the first variant ID as a representative, but we'll use it differently in upload
+                                          filtered = [...filtered, selectedGroup.variants[0].id];
+                                        }
                                       }
+
+                                      setSelectedMappingAccessories(filtered);
                                     }}
                                   />
                                 </BlockStack>
@@ -1681,20 +2011,29 @@ export default function Index() {
                                 <Text as="p" variant="headingMd">Upload image for this mapping</Text>
                                 <Text as="p" tone="subdued" variant="bodySm">
                                   Base: {(() => {
-                                    const baseGroup = baseColorGroups.find((g) =>
-                                      g.variants.some((v) => v.id === selectedBaseVariantId)
-                                    );
-                                    const baseVariant = baseGroup?.variants.find((v) => v.id === selectedBaseVariantId);
-                                    return `${baseGroup?.label} - ${baseVariant?.title}`;
+                                    const baseGroup = baseColorGroups.find((g) => g.key === selectedBaseColorKey);
+                                    return `${baseGroup?.label} (${baseGroup?.variants.length || 0} variant${baseGroup?.variants.length !== 1 ? 's' : ''})`;
                                   })()}
                                 </Text>
                                 <Text as="p" tone="subdued" variant="bodySm">
                                   Accessories: {selectedMappingAccessories.map((variantId) => {
                                     const accId = selectedAccessories.find((id) => {
-                                      const prod = products.find((p) => p && p.id === id);
+                                      const prod = products.find((p) => p?.id === id);
                                       return prod?.variants?.edges?.some((e) => e.node.id === variantId);
                                     });
                                     const prod = products.find((p) => p && p.id === accId);
+
+                                    // Check if grouping is enabled for this accessory
+                                    const grouping = accessoryGroupingModes[accId || ""];
+                                    if (grouping?.enabled && grouping.option) {
+                                      // Find the group this variant belongs to
+                                      const accGroups = getAccessoryGroups(accId || "");
+                                      const group = accGroups.find(g => g.variants.some(v => v.id === variantId));
+                                      if (group) {
+                                        return `${prod?.title} - ${group.label} (${group.variants.length} variant${group.variants.length !== 1 ? 's' : ''})`;
+                                      }
+                                    }
+
                                     return `${prod?.title} - ${resolveAccessoryVariantTitle(accId || "", variantId)}`;
                                   }).join(", ")}
                                 </Text>
@@ -1702,9 +2041,7 @@ export default function Index() {
                                 <Box minWidth="300px">
                                   <SimpleImagePicker
                                     initialUrl={(() => {
-                                      const baseGroup = baseColorGroups.find((g) =>
-                                        g.variants.some((v) => v.id === selectedBaseVariantId)
-                                      );
+                                      const baseGroup = baseColorGroups.find((g) => g.key === selectedBaseColorKey);
                                       if (!baseGroup) return undefined;
 
                                       if (selectedMappingAccessories.length === 1) {
@@ -1716,27 +2053,43 @@ export default function Index() {
                                     })()}
                                     uploading={uploadInFlight}
                                     onFileSelected={(file) => {
-                                      const baseGroup = baseColorGroups.find((g) =>
-                                        g.variants.some((v) => v.id === selectedBaseVariantId)
-                                      );
+                                      const baseGroup = baseColorGroups.find((g) => g.key === selectedBaseColorKey);
                                       if (!baseGroup) return;
 
+                                      // Get base variant option metadata
+                                      const baseVariant = baseGroup.variants[0];
+                                      const baseOption = baseVariant ? getGroupingOptionFromVariant(baseVariant, variantGroupingMode) : { name: null, value: null };
+
                                       if (selectedMappingAccessories.length === 1) {
+                                        const variantId = selectedMappingAccessories[0];
                                         const accId = selectedAccessories.find((id) => {
-                                          const prod = products.find((p) => p.id === id);
-                                          return prod?.variants?.edges?.some((e) => e.node.id === selectedMappingAccessories[0]);
-                                        }) || selectedMappingAccessories[0];
+                                          const prod = products.find((p) => p?.id === id);
+                                          return prod?.variants?.edges?.some((e) => e.node.id === variantId);
+                                        }) || variantId;
+
+                                        // Get accessory variant option metadata
+                                        const accProd = products.find(p => p?.id === accId);
+                                        const accVariant = accProd?.variants?.edges?.find(e => e.node.id === variantId)?.node;
+                                        const grouping = accessoryGroupingModes[accId];
+                                        const accessoryOption = accVariant ? getGroupingOptionFromVariant(accVariant, grouping?.option || "color") : { name: null, value: null };
+
                                         handleFileSelected(
                                           baseGroup.key,
                                           accId,
-                                          selectedMappingAccessories[0],
-                                          file
+                                          variantId,
+                                          file,
+                                          {
+                                            baseOptionName: baseOption.name || undefined,
+                                            baseOptionValue: baseOption.value || undefined,
+                                            accessoryOptionName: accessoryOption.name || undefined,
+                                            accessoryOptionValue: accessoryOption.value || undefined,
+                                          }
                                         );
                                       } else {
                                         const comboKey = buildCombinationKey(selectedMappingAccessories);
                                         const accessoryIds = selectedMappingAccessories.map((variantId) => {
                                           return selectedAccessories.find((id) => {
-                                            const prod = products.find((p) => p.id === id);
+                                            const prod = products.find((p) => p?.id === id);
                                             return prod?.variants?.edges?.some((e) => e.node.id === variantId);
                                           }) || variantId;
                                         });
@@ -1770,15 +2123,19 @@ export default function Index() {
               {Object.keys(colorImageMap || {}).length > 0 && (
                 <Card>
                   <BlockStack gap="300">
-                    <Text as="h3" variant="headingMd">Existing mappings ({Object.values(colorImageMap || {}).reduce((sum, group) => sum + Object.keys(group).length, 0)})</Text>
+                    <Text as="h3" variant="headingMd">Existing mappings</Text>
                     {baseColorGroups.map((group) => {
                       const groupMappings = colorImageMap?.[group.key] || {};
-                      const mappingCount = Object.keys(groupMappings).length;
+                      // Count unique accessory products (not variant entries)
+                      const uniqueAccessories = new Set(
+                        Object.values(groupMappings).map((m: any) => m.accessoryProductId).filter(Boolean)
+                      );
+                      const mappingCount = uniqueAccessories.size;
 
                       if (mappingCount === 0) return null;
 
                       return (
-                        <Box key={`existing-${group.key}`} padding="200" borderColor="border-subdued" borderWidth="025" borderRadius="200">
+                        <Box key={`existing-${group.key}`} padding="200" borderColor="border" borderWidth="025" borderRadius="200">
                           <BlockStack gap="200">
                             <InlineStack gap="200" blockAlign="center">
                               <Tag>{group.label}</Tag>
@@ -1816,11 +2173,34 @@ export default function Index() {
                                                 {(() => {
                                                   const accId = mapping.accessoryProductId || key;
                                                   const prod = products.find((p) => p && p.id === accId);
+                                                  // Show option-based matching if available
+                                                  if (mapping.accessoryOptionName && mapping.accessoryOptionValue) {
+                                                    return `${prod?.title || "Accessory"} — ${mapping.accessoryOptionValue}`;
+                                                  }
                                                   return prod?.title || "Accessory";
                                                 })()}
                                               </Text>
                                               <Text as="p" tone="subdued" variant="bodySm">
-                                                {resolveAccessoryVariantTitle(mapping.accessoryProductId || key, mapping.variantId || key)}
+                                                {(() => {
+                                                  // Show that this applies to all matching variants
+                                                  if (mapping.accessoryOptionName && mapping.accessoryOptionValue) {
+                                                    const accId = mapping.accessoryProductId || key;
+                                                    const prod = products.find((p) => p && p.id === accId);
+                                                    const groups = getAccessoryGroups(accId);
+                                                    const matchingGroup = groups.find(g => {
+                                                      const firstVariant = g.variants[0];
+                                                      if (!firstVariant) return false;
+                                                      const opt = firstVariant.selectedOptions?.find(o =>
+                                                        o.name === mapping.accessoryOptionName
+                                                      );
+                                                      return opt?.value === mapping.accessoryOptionValue;
+                                                    });
+                                                    if (matchingGroup) {
+                                                      return `All ${matchingGroup.variants.length} variant(s) with ${mapping.accessoryOptionName}=${mapping.accessoryOptionValue}`;
+                                                    }
+                                                  }
+                                                  return resolveAccessoryVariantTitle(mapping.accessoryProductId || key, mapping.variantId || key);
+                                                })()}
                                               </Text>
                                             </>
                                           )}
@@ -1864,12 +2244,10 @@ export default function Index() {
                   <Card key={group.key}>
                     <BlockStack gap="200">
                       <Box paddingBlock="300" paddingInline="400">
-                        <Button
-                          fullWidth
-                          textAlign="start"
-                          disclosure={isExpanded ? "up" : "down"}
-                          ariaExpanded={isExpanded}
-                          ariaControls={`collapsible-${group.key}`}
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          style={{ cursor: 'pointer', width: '100%' }}
                           onClick={() => {
                             setExpandedGroups((prev) => {
                               const next = new Set(prev);
@@ -1881,15 +2259,32 @@ export default function Index() {
                               return next;
                             });
                           }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              setExpandedGroups((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(group.key)) {
+                                  next.delete(group.key);
+                                } else {
+                                  next.add(group.key);
+                                }
+                                return next;
+                              });
+                            }
+                          }}
                         >
                           <InlineStack gap="200" blockAlign="center">
                             <Tag>{group.label}</Tag>
-                            <Text tone="subdued">{group.variants.length} variant(s)</Text>
+                            <Text as="span" tone="subdued">{group.variants.length} variant(s)</Text>
                             {mappingCount > 0 && (
-                              <Tag tone="success">{mappingCount} mapped</Tag>
+                              <Tag>{mappingCount} mapped</Tag>
                             )}
+                            <div style={{ marginLeft: 'auto' }}>
+                              <Icon source={isExpanded ? ChevronUpIcon : ChevronDownIcon} />
+                            </div>
                           </InlineStack>
-                        </Button>
+                        </div>
                       </Box>
 
                       <Collapsible
@@ -1900,11 +2295,11 @@ export default function Index() {
                         <Box paddingInline="400" paddingBlockEnd="400">
                           <BlockStack gap="300">
                             {selectedAccessories.length === 0 && (
-                              <Text tone="subdued">Add accessory categories to upload mappings.</Text>
+                              <Text as="p" tone="subdued">Add accessory categories to upload mappings.</Text>
                             )}
 
                             {selectedAccessories.flatMap((accId) => {
-                              const accProduct = accessoryProducts.find((p) => p.id === accId);
+                              const accProduct = accessoryProducts.find((p) => p?.id === accId);
                               const variantIds = resolveAccessoryVariantIds(accId);
                               return variantIds.map((accessoryVariantId) => {
                                 const accessoryVariantTitle = resolveAccessoryVariantTitle(accId, accessoryVariantId);
@@ -1918,10 +2313,10 @@ export default function Index() {
                                           <Thumbnail size="small" source={accProduct?.featuredImage?.url || ""} alt={accProduct?.title || "Accessory"} />
                                           <BlockStack gap="050">
                                             <Text as="p">{accProduct?.title || "Accessory"}</Text>
-                                            <Text tone="subdued" variant="bodySm">{accessoryVariantTitle}</Text>
+                                            <Text as="p" tone="subdued" variant="bodySm">{accessoryVariantTitle}</Text>
                                           </BlockStack>
                                         </InlineStack>
-                                        <Tag tone="attention">Accessory</Tag>
+                                        <Tag>Accessory</Tag>
                                       </InlineStack>
 
                                       <InlineStack align="space-between" blockAlign="center">
@@ -1956,7 +2351,7 @@ export default function Index() {
                                       <InlineStack align="space-between" blockAlign="center">
                                         <BlockStack gap="050">
                                           <Text as="p">{comboLabel}</Text>
-                                          <Text tone="subdued" variant="bodySm">Applies when all selected</Text>
+                                          <Text as="p" tone="subdued" variant="bodySm">Applies when all selected</Text>
                                           {existingCombo?.fileUrl && (
                                             <Thumbnail size="small" source={existingCombo.fileUrl} alt="Uploaded" />
                                           )}
@@ -1989,7 +2384,11 @@ export default function Index() {
               })}
 
               <InlineStack gap="200">
-                <Button onClick={() => setStep("configure")}>Back to configuration</Button>
+                <Button onClick={() => {
+                  setSelectedBaseColorKey("");
+                  setSelectedMappingAccessories([]);
+                  setStep("configure");
+                }}>Back to configuration</Button>
                 <Button
                   variant="primary"
                   onClick={() => {
@@ -2006,10 +2405,12 @@ export default function Index() {
                       setRuleCategories([]);
                       setColorImageMap({});
                       setColorImageMapByBase({});
+                      setSelectedBaseColorKey("");
+                      setSelectedMappingAccessories([]);
                       setStep("list");
                     }, 100);
                   }}
-                  disabled={uploading || uploadInFlight || Object.keys(colorImageMap || {}).length === 0}
+                  disabled={uploading || uploadInFlight}
                   loading={uploading || uploadInFlight}
                 >
                   Save & return to rulesets
