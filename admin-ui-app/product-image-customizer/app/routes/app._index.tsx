@@ -85,6 +85,8 @@ type ColorImageMap = Record<
       baseOptionValue?: string;
       accessoryOptionName?: string;
       accessoryOptionValue?: string;
+      // For combination mappings with multiple accessories
+      accessoryMetadata?: any;
     }
   >
 >; // baseColorKey -> accessoryProductId
@@ -545,12 +547,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const baseOptionValue = formData.get("baseOptionValue") as string | null;
     const accessoryOptionName = formData.get("accessoryOptionName") as string | null;
     const accessoryOptionValue = formData.get("accessoryOptionValue") as string | null;
+    const accessoryMetadataRaw = formData.get("accessoryMetadata") as string | null;
     let combinationMeta = null;
     if (combinationMetaRaw) {
       try {
         combinationMeta = JSON.parse(combinationMetaRaw);
       } catch (e) {
         combinationMeta = null;
+      }
+    }
+    let accessoryMetadata = null;
+    if (accessoryMetadataRaw) {
+      try {
+        accessoryMetadata = JSON.parse(accessoryMetadataRaw);
+      } catch (e) {
+        accessoryMetadata = null;
       }
     }
     const file = formData.get("file");
@@ -641,6 +652,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       baseOptionValue,
       accessoryOptionName,
       accessoryOptionValue,
+      accessoryMetadata,
     });
   }
 
@@ -929,29 +941,46 @@ export default function Index() {
   }, [products, selectedProductId]);
 
   useEffect(() => {
+    // Use loader data as source of truth, but preserve local edits during active editing
     setRulesetList((prev) => {
       if (!rulesets?.length) return prev;
       if (!prev.length) return rulesets;
-      // Merge loader data with local state, preserving local maps/categories/base products when loader is stale.
+
+      // Merge loader data with local state
       return rulesets.map((r: Ruleset) => {
         const local = prev.find((p) => p.id === r.id);
         if (!local) return r;
-        return {
-          ...r,
-          baseProducts: local.baseProducts?.length ? local.baseProducts : r.baseProducts,
-          categories: local.categories?.length ? local.categories : r.categories,
-          colorMapByBase:
-            local.colorMapByBase && Object.keys(local.colorMapByBase).length
-              ? local.colorMapByBase
-              : r.colorMapByBase,
-          variantMapByBase:
-            local.variantMapByBase && Object.keys(local.variantMapByBase).length
-              ? local.variantMapByBase
-              : r.variantMapByBase,
-        };
+
+        // If we're actively editing this ruleset, preserve local changes
+        if (r.id === selectedRulesetId && step === "mappings") {
+          // Check if local has unsaved changes by comparing colorMapByBase sizes
+          const localColorMapSize = Object.keys(local.colorMapByBase || {}).length;
+          const loaderColorMapSize = Object.keys(r.colorMapByBase || {}).length;
+
+          // If local has more data, it means we have unsaved changes - keep local
+          if (localColorMapSize > loaderColorMapSize) {
+            return {
+              ...r,
+              colorMapByBase: local.colorMapByBase,
+              variantMapByBase: local.variantMapByBase || r.variantMapByBase,
+            };
+          }
+        }
+
+        // For configure step, preserve local base products and categories
+        if (r.id === selectedRulesetId && step === "configure") {
+          return {
+            ...r,
+            baseProducts: local.baseProducts?.length ? local.baseProducts : r.baseProducts,
+            categories: local.categories?.length ? local.categories : r.categories,
+          };
+        }
+
+        // Otherwise use fresh loader data
+        return r;
       });
     });
-  }, [rulesets]);
+  }, [rulesets, step, selectedRulesetId]);
 
   useEffect(() => {
     if (!selectedRulesetId) return;
@@ -963,11 +992,26 @@ export default function Index() {
     setSelectedRulesetHandle(rs.handle || "");
     setSelectedBaseProducts(rs.baseProducts || []);
     setRuleCategories(rs.categories || []);
+
+    // Only update colorImageMapByBase if incoming data is newer/larger
+    // This prevents stale data from overwriting fresh saves
     setColorImageMapByBase((prev) => {
       const incoming = rs.colorMapByBase || {};
+      const incomingSize = Object.keys(incoming).reduce((sum, key) =>
+        sum + Object.keys(incoming[key] || {}).length, 0
+      );
+      const prevSize = Object.keys(prev).reduce((sum, key) =>
+        sum + Object.keys(prev[key] || {}).length, 0
+      );
+
+      // If prev has more data, keep it (it's likely a fresh save)
+      if (prevSize > incomingSize) return prev;
+
+      // Otherwise merge, preferring prev for any conflicts
       if (!Object.keys(incoming).length) return prev;
       return { ...prev, ...incoming };
     });
+
     if (rs.baseProducts?.length) {
       setSelectedProductId(rs.baseProducts[0]);
       setColorImageMap((prev) => {
@@ -997,7 +1041,10 @@ export default function Index() {
       setColorImageMap({});
       return;
     }
-    setColorImageMap(colorImageMapByBase[selectedProductId] || {});
+    const mapForThisProduct = colorImageMapByBase[selectedProductId] || {};
+    console.log(`📊 Loading mappings for product ${selectedProductId}:`, mapForThisProduct);
+    console.log(`📊 All available base products in colorImageMapByBase:`, Object.keys(colorImageMapByBase));
+    setColorImageMap(mapForThisProduct);
   }, [selectedProductId, colorImageMapByBase]);
 
   // Keep accessory-variant selections in sync with accessory choices
@@ -1040,47 +1087,54 @@ export default function Index() {
           }
         }
       }
+
+      // Only update rulesetList during active editing, not when saving to backend
+      // Let the loader be the source of truth when navigating back to list view
       if (data.handle || data.name) {
-        setRulesetList((prev) => {
-          const exists = prev.find((r) => r.id === data.rulesetId);
-          const nextPayload = {
-            baseProducts: data.baseProducts || selectedBaseProducts,
-            categories: data.categories || ruleCategories,
-            colorMapByBase: data.colorMapByBase || colorImageMapByBase,
-            variantMapByBase: data.variantMapByBase || {},
-          };
-          if (exists) {
-            return prev.map((r) =>
-              r.id === data.rulesetId
-                ? {
-                  ...r,
-                  name: data.name || r.name,
-                  handle: data.handle || r.handle,
-                  ...nextPayload,
-                  variantMapByBase:
-                    nextPayload.variantMapByBase && Object.keys(nextPayload.variantMapByBase).length
-                      ? nextPayload.variantMapByBase
-                      : r.variantMapByBase,
-                }
-                : r,
-            );
-          }
-          return [
-            ...prev,
-            {
-              id: data.rulesetId,
-              handle: data.handle || data.rulesetId,
-              name: data.name || "Ruleset",
-              accessories: [],
-              ...nextPayload,
-            },
-          ];
-        });
+        // Don't update rulesetList for save_color_map - loader will handle it
+        if (lastAction !== "save_color_map") {
+          setRulesetList((prev) => {
+            const exists = prev.find((r) => r.id === data.rulesetId);
+            const nextPayload = {
+              baseProducts: data.baseProducts || selectedBaseProducts,
+              categories: data.categories || ruleCategories,
+              colorMapByBase: data.colorMapByBase || colorImageMapByBase,
+              variantMapByBase: data.variantMapByBase || {},
+            };
+            if (exists) {
+              return prev.map((r) =>
+                r.id === data.rulesetId
+                  ? {
+                    ...r,
+                    name: data.name || r.name,
+                    handle: data.handle || r.handle,
+                    ...nextPayload,
+                    variantMapByBase:
+                      nextPayload.variantMapByBase && Object.keys(nextPayload.variantMapByBase).length
+                        ? nextPayload.variantMapByBase
+                        : r.variantMapByBase,
+                  }
+                  : r,
+              );
+            }
+            return [
+              ...prev,
+              {
+                id: data.rulesetId,
+                handle: data.handle || data.rulesetId,
+                name: data.name || "Ruleset",
+                accessories: [],
+                ...nextPayload,
+              },
+            ];
+          });
+        }
       }
       if (lastAction === "save_ruleset") {
         setStep("mappings");
       } else if (lastAction === "save_color_map") {
         // Don't navigate - the button handler will do it
+        // Loader will provide fresh data after navigation
       } else if (lastAction === "create_ruleset") {
         setStep("configure");
       } else if (lastAction === "clear_mappings") {
@@ -1145,6 +1199,7 @@ export default function Index() {
           baseOptionValue: data.baseOptionValue,
           accessoryOptionName: data.accessoryOptionName,
           accessoryOptionValue: data.accessoryOptionValue,
+          accessoryMetadata: data.accessoryMetadata,
         };
         if (combinationKey) {
           next[colorKey][combinationKey] = payload;
@@ -1158,19 +1213,6 @@ export default function Index() {
           ...prevMaps,
           [selectedProductId]: next,
         }));
-        // Persist in ruleset list so loader revalidation doesn't wipe freshly uploaded images.
-        if (selectedRulesetId) {
-          setRulesetList((prev) =>
-            prev.map((r) =>
-              r.id === selectedRulesetId
-                ? {
-                  ...r,
-                  colorMapByBase: { ...(r.colorMapByBase || {}), [selectedProductId]: next },
-                }
-                : r,
-            ),
-          );
-        }
         return next;
       });
     }
@@ -1189,6 +1231,7 @@ export default function Index() {
       baseOptionValue?: string;
       accessoryOptionName?: string;
       accessoryOptionValue?: string;
+      accessoryMetadata?: string;
     },
   ) => {
     if (!selectedProductId) return;
@@ -1232,6 +1275,7 @@ export default function Index() {
     if (options?.baseOptionValue) fd.append("baseOptionValue", options.baseOptionValue);
     if (options?.accessoryOptionName) fd.append("accessoryOptionName", options.accessoryOptionName);
     if (options?.accessoryOptionValue) fd.append("accessoryOptionValue", options.accessoryOptionValue);
+    if (options?.accessoryMetadata) fd.append("accessoryMetadata", options.accessoryMetadata);
     fd.append("file", file);
     uploadFetcher.submit(fd, { method: "post", encType: "multipart/form-data" });
   };
@@ -1239,104 +1283,182 @@ export default function Index() {
   const handleSaveColorMap = () => {
     if (!selectedProductId) return;
 
-    // Expand color-based map to variant-based map so storefront can resolve quickly
-    const variantMap: VariantImageMap = {};
-    const colorMapToSave: ColorImageMap = JSON.parse(JSON.stringify(colorImageMap || {}));
-
     console.log("🔧 handleSaveColorMap called");
     console.log("baseColorGroups:", baseColorGroups);
     console.log("colorImageMap:", colorImageMap);
 
-    baseColorGroups.forEach((baseGroup) => {
-      baseGroup.variants.forEach((variant) => {
-        const variantKeys = [variant.id, toNumericId(variant.id)];
-        variantKeys.forEach((key) => {
-          if (!key) return;
-          if (!variantMap[key]) variantMap[key] = {};
+    // Build the complete color map payload for ALL base products
+    const colorPayload = { ...colorImageMapByBase, [selectedProductId]: colorImageMap };
+
+    // Rebuild the ENTIRE variant map from scratch from the complete color map
+    // This ensures no stale mappings remain
+    const variantMap: VariantImageMap = {};
+
+    // Process ALL base products in the ruleset, not just the current one
+    selectedBaseProducts.forEach((baseProductId) => {
+      const baseProduct = products.find(p => p?.id === baseProductId);
+      if (!baseProduct) return;
+
+      // Get all variant groups for this base product
+      const baseProductGroups = groupVariantsByOption(baseProduct, baseGroupingEnabled ? variantGroupingMode : "none");
+
+      // Get the color map for this specific base product
+      const baseProductColorMap = colorPayload[baseProductId] || {};
+
+      baseProductGroups.forEach((baseGroup) => {
+        // Initialize variantMap entries for all base variants
+        baseGroup.variants.forEach((variant) => {
+          const variantKeys = [variant.id, toNumericId(variant.id)];
+          variantKeys.forEach((key) => {
+            if (!key) return;
+            if (!variantMap[key]) variantMap[key] = {};
+          });
         });
-      });
 
-      const mapForColor = colorImageMap?.[baseGroup.key] || {};
-      Object.entries(mapForColor).forEach(([key, entry]) => {
-        if (!entry?.fileUrl) return;
-        const payload = {
-          ...entry,
-          accessoryProductId: entry.accessoryProductId || key,
-          variantId: entry.variantId || key,
-          baseOptionName: entry.baseOptionName,
-          baseOptionValue: entry.baseOptionValue,
-          accessoryOptionName: entry.accessoryOptionName,
-          accessoryOptionValue: entry.accessoryOptionValue,
-        };
+        const mapForColor = baseProductColorMap[baseGroup.key] || {};
+        Object.entries(mapForColor).forEach(([key, entry]) => {
+          if (!entry?.fileUrl) return;
 
-        if (!colorMapToSave[baseGroup.key]) colorMapToSave[baseGroup.key] = {};
-        colorMapToSave[baseGroup.key][key] = payload;
+          const payload: any = {
+            fileUrl: entry.fileUrl,
+            fileId: entry.fileId,
+            baseColor: baseGroup.label,
+            accessoryProductId: entry.accessoryProductId || key,
+            variantId: entry.variantId || key,
+            baseOptionName: entry.baseOptionName,
+            baseOptionValue: entry.baseOptionValue,
+            accessoryOptionName: entry.accessoryOptionName,
+            accessoryOptionValue: entry.accessoryOptionValue,
+          };
 
-        // Find ALL accessory variants that match the option criteria
-        let accessoryVariantIds: string[] = [];
-
-        if (entry.accessoryOptionName && entry.accessoryOptionValue && entry.accessoryProductId) {
-          // Option-based matching: find all variants with matching option value
-          const accProduct = products.find(p => p?.id === entry.accessoryProductId);
-          if (accProduct?.variants?.edges) {
-            accessoryVariantIds = accProduct.variants.edges
-              .map(({ node }) => {
-                const optMatch = node.selectedOptions?.find(opt =>
-                  opt.name === entry.accessoryOptionName &&
-                  opt.value === entry.accessoryOptionValue
-                );
-                return optMatch ? node.id : null;
-              })
-              .filter((id): id is string => id !== null);
+          // CRITICAL: Include accessoryMetadata in variantMap payload so storefront can identify combinations
+          if (entry.accessoryMetadata) {
+            payload.accessoryMetadata = entry.accessoryMetadata;
           }
-        }
 
-        // Fallback to key-based matching if no option matching
-        if (accessoryVariantIds.length === 0) {
-          accessoryVariantIds = [key];
-        }
+          // Handle combination mappings with multiple accessories
+          if (entry.accessoryMetadata && Array.isArray(entry.accessoryMetadata)) {
+            // For each accessory in the combination, find ALL matching variants
+            const expandedAccessoriesPerGroup = entry.accessoryMetadata.map((meta: any) => {
+              if (meta.optionName && meta.optionValue && meta.accessoryId) {
+                const accProduct = products.find(p => p?.id === meta.accessoryId);
+                if (accProduct?.variants?.edges) {
+                  const matchingVariants = accProduct.variants.edges
+                    .filter(({ node }) =>
+                      node.selectedOptions?.some(opt =>
+                        opt.name === meta.optionName && opt.value === meta.optionValue
+                      )
+                    )
+                    .map(({ node }) => node.id);
+                  return matchingVariants.length > 0 ? matchingVariants : [meta.variantId];
+                }
+              }
+              return [meta.variantId];
+            });
 
-        // Expand to all combinations: base variants × matching accessory variants
-        baseGroup.variants.forEach((baseVariant) => {
-          const baseKeys = [baseVariant.id, toNumericId(baseVariant.id)];
+            // Create all combinations of accessory variants
+            const accessoryCombinations = expandedAccessoriesPerGroup.reduce(
+              (acc: string[][], variants: string[]) =>
+                acc.flatMap((prev) => variants.map((v) => [...prev, v])),
+              [[]] as string[][]
+            );
 
-          accessoryVariantIds.forEach((accVariantId) => {
-            const accessoryKeys = [accVariantId, toNumericId(accVariantId)].filter(Boolean);
+            // Expand to all base variants × accessory combinations
+            baseGroup.variants.forEach((baseVariant) => {
+              const baseKeys = [baseVariant.id, toNumericId(baseVariant.id)];
 
-            baseKeys.forEach((bKey) => {
-              if (!bKey) return;
-              if (!variantMap[bKey]) variantMap[bKey] = {};
+              accessoryCombinations.forEach((accCombo) => {
+                const comboKey = buildCombinationKey(accCombo);
+                const comboKeys = [comboKey, ...accCombo.flatMap(id => [id, toNumericId(id)])].filter(Boolean);
 
-              // Store under both accessory GID and numeric ID
-              accessoryKeys.filter((k): k is string => k !== null && k !== undefined).forEach((accKey) => {
-                variantMap[bKey][accKey] = {
-                  ...payload,
-                  baseColor: baseGroup.label,
-                };
+                baseKeys.forEach((bKey) => {
+                  if (!bKey) return;
+                  if (!variantMap[bKey]) variantMap[bKey] = {};
+
+                  comboKeys.filter((k): k is string => k !== null && k !== undefined).forEach((cKey) => {
+                    variantMap[bKey][cKey] = payload;
+                  });
+                });
               });
             });
-          });
+          } else {
+            // Single accessory mapping
+            let accessoryVariantIds: string[] = [];
+
+            if (entry.accessoryOptionName && entry.accessoryOptionValue && entry.accessoryProductId) {
+              // Option-based matching: find all variants with matching option value
+              const accProduct = products.find(p => p?.id === entry.accessoryProductId);
+              if (accProduct?.variants?.edges) {
+                accessoryVariantIds = accProduct.variants.edges
+                  .map(({ node }) => {
+                    const optMatch = node.selectedOptions?.find(opt =>
+                      opt.name === entry.accessoryOptionName &&
+                      opt.value === entry.accessoryOptionValue
+                    );
+                    return optMatch ? node.id : null;
+                  })
+                  .filter((id): id is string => id !== null);
+              }
+            }
+
+            // Fallback to key-based matching if no option matching
+            if (accessoryVariantIds.length === 0) {
+              accessoryVariantIds = [key];
+            }
+
+            // Expand to all combinations: base variants × matching accessory variants
+            baseGroup.variants.forEach((baseVariant) => {
+              const baseKeys = [baseVariant.id, toNumericId(baseVariant.id)];
+
+              accessoryVariantIds.forEach((accVariantId) => {
+                const accessoryKeys = [accVariantId, toNumericId(accVariantId)].filter(Boolean);
+
+                baseKeys.forEach((bKey) => {
+                  if (!bKey) return;
+                  if (!variantMap[bKey]) variantMap[bKey] = {};
+
+                  // Store under both accessory GID and numeric ID
+                  accessoryKeys.filter((k): k is string => k !== null && k !== undefined).forEach((accKey) => {
+                    variantMap[bKey][accKey] = payload;
+                  });
+                });
+              });
+            });
+          }
         });
       });
     });
 
-    console.log("📦 variantMap built:", variantMap);
-    console.log("🎨 colorMapToSave built:", colorMapToSave);
+    // Clean up empty string keys and empty objects
+    const cleanedColorPayload: Record<string, ColorImageMap> = {};
+    Object.entries(colorPayload).forEach(([baseProductId, mapping]) => {
+      if (baseProductId && baseProductId.trim() !== "") {
+        cleanedColorPayload[baseProductId] = mapping;
+      } else {
+        console.warn("⚠️ Removing empty string key from colorPayload");
+      }
+    });
+
+    // Remove empty variant map entries
+    const cleanedVariantMap: any = {};
+    Object.entries(variantMap).forEach(([variantId, mappings]) => {
+      if (Object.keys(mappings as any).length > 0) {
+        cleanedVariantMap[variantId] = mappings;
+      }
+    });
+
+    console.log("📦 variantMap rebuilt (cleaned):", cleanedVariantMap);
+    console.log("🎨 colorPayload built (cleaned):", cleanedColorPayload);
 
     const formData = new FormData();
     formData.append("action", "save_color_map");
     formData.append("rulesetId", selectedRulesetId || "");
     if (selectedRulesetHandle) formData.append("handle", selectedRulesetHandle);
-    const colorPayload = { ...colorImageMapByBase, [selectedProductId]: colorMapToSave };
 
-    // Merge variantMap directly (not nested under product ID)
-    const existingVariantMap = (rulesetList.find((r) => r.id === selectedRulesetId)?.variantMapByBase as any) || {};
-    const variantPayload = { ...existingVariantMap, ...variantMap };
-
-    console.log("📮 Submitting - colorPayload:", colorPayload);
-    console.log("📮 Submitting - variantPayload:", variantPayload);
-    formData.append("colorMap", JSON.stringify(colorPayload));
-    formData.append("variantMap", JSON.stringify(variantPayload));
+    console.log("📮 Submitting - colorPayload:", cleanedColorPayload);
+    console.log("📮 Submitting - variantPayload:", cleanedVariantMap);
+    formData.append("colorMap", JSON.stringify(cleanedColorPayload));
+    formData.append("variantMap", JSON.stringify(cleanedVariantMap));
     fetcher.submit(formData, { method: "post" });
     setColorImageMapByBase(colorPayload);
   };
@@ -2087,12 +2209,29 @@ export default function Index() {
                                         );
                                       } else {
                                         const comboKey = buildCombinationKey(selectedMappingAccessories);
-                                        const accessoryIds = selectedMappingAccessories.map((variantId) => {
-                                          return selectedAccessories.find((id) => {
+
+                                        // Extract option metadata for each accessory in the combination
+                                        const accessoryMetadata = selectedMappingAccessories.map((variantId) => {
+                                          const accId = selectedAccessories.find((id) => {
                                             const prod = products.find((p) => p?.id === id);
                                             return prod?.variants?.edges?.some((e) => e.node.id === variantId);
                                           }) || variantId;
+
+                                          const accProd = products.find(p => p?.id === accId);
+                                          const accVariant = accProd?.variants?.edges?.find(e => e.node.id === variantId)?.node;
+                                          const grouping = accessoryGroupingModes[accId];
+                                          const accessoryOption = accVariant ? getGroupingOptionFromVariant(accVariant, grouping?.option || "color") : { name: null, value: null };
+
+                                          return {
+                                            accessoryId: accId,
+                                            variantId,
+                                            optionName: accessoryOption.name,
+                                            optionValue: accessoryOption.value,
+                                          };
                                         });
+
+                                        const accessoryIds = accessoryMetadata.map(m => m.accessoryId);
+
                                         handleFileSelected(
                                           baseGroup.key,
                                           comboKey,
@@ -2102,6 +2241,10 @@ export default function Index() {
                                             combinationKey: comboKey,
                                             accessoryIds,
                                             variantIds: selectedMappingAccessories,
+                                            baseOptionName: baseOption.name || undefined,
+                                            baseOptionValue: baseOption.value || undefined,
+                                            // Store array of accessory option metadata for expansion
+                                            accessoryMetadata: JSON.stringify(accessoryMetadata),
                                           }
                                         );
                                       }
@@ -2156,15 +2299,37 @@ export default function Index() {
                                             <>
                                               <Text as="p" variant="bodySm">Combination mapping</Text>
                                               <Text as="p" tone="subdued" variant="bodySm">
-                                                {(mapping.variantIds || []).map((vId: string) => {
-                                                  const accId = selectedAccessories.find((id) => {
-                                                    const prod = products.find((p) => p && p.id === id);
-                                                    return prod?.variants?.edges?.some((e) => e.node.id === vId);
-                                                  });
-                                                  const prod = products.find((p) => p && p.id === accId);
-                                                  const variant = prod?.variants?.edges?.find((e) => e.node.id === vId)?.node;
-                                                  return `${prod?.title || "Accessory"} - ${variant?.title || "Variant"}`;
-                                                }).join(" + ")}
+                                                {(() => {
+                                                  // Check if we have accessoryMetadata with option information
+                                                  if (mapping.accessoryMetadata && Array.isArray(mapping.accessoryMetadata)) {
+                                                    return mapping.accessoryMetadata.map((meta: any) => {
+                                                      const prod = products.find((p) => p && p.id === meta.accessoryId);
+                                                      if (meta.optionName && meta.optionValue) {
+                                                        // Find how many variants match this option
+                                                        const matchingCount = prod?.variants?.edges?.filter(({ node }) =>
+                                                          node.selectedOptions?.some(opt =>
+                                                            opt.name === meta.optionName && opt.value === meta.optionValue
+                                                          )
+                                                        ).length || 0;
+                                                        return `${prod?.title || "Accessory"} - ${meta.optionValue} (${matchingCount} variant${matchingCount !== 1 ? 's' : ''})`;
+                                                      }
+                                                      // Fallback to variant title if no option metadata
+                                                      const variant = prod?.variants?.edges?.find((e) => e.node.id === meta.variantId)?.node;
+                                                      return `${prod?.title || "Accessory"} - ${variant?.title || "Variant"}`;
+                                                    }).join(" + ");
+                                                  }
+
+                                                  // Fallback to old display logic
+                                                  return (mapping.variantIds || []).map((vId: string) => {
+                                                    const accId = selectedAccessories.find((id) => {
+                                                      const prod = products.find((p) => p && p.id === id);
+                                                      return prod?.variants?.edges?.some((e) => e.node.id === vId);
+                                                    });
+                                                    const prod = products.find((p) => p && p.id === accId);
+                                                    const variant = prod?.variants?.edges?.find((e) => e.node.id === vId)?.node;
+                                                    return `${prod?.title || "Accessory"} - ${variant?.title || "Variant"}`;
+                                                  }).join(" + ");
+                                                })()}
                                               </Text>
                                             </>
                                           ) : (

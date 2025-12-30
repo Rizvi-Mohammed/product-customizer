@@ -351,6 +351,7 @@
             const btn = document.createElement("button");
             btn.type = "button";
             btn.className = "accessory-picker__category-option";
+            btn.setAttribute("data-accessory-id", data.id); // Add data attribute for easy lookup
             if (isUnavailable) btn.classList.add("is-unavailable");
             btn.disabled = !!isUnavailable;
             btn.innerHTML = [
@@ -591,15 +592,105 @@
         const tryVariant = (key) => (baseVariantId && key ? normalizedVariantMap?.[baseVariantId]?.[key] : null);
         const tryColor = (key) => (colorVal && key ? normalizedColorMap?.[colorVal]?.[key] : null);
 
-        const combinationKey = buildCombinationKey(
-          (selections || []).map((sel) => sel?.variantId || sel?.accessoryId)
-        );
+        console.log('🔍 resolveEntryForSelections called:', {
+          baseVariantId,
+          colorVal,
+          selectionsCount: selections?.length,
+          selections: selections?.map(s => ({ variantId: s.variantId, accessoryId: s.accessoryId }))
+        });
 
-        if (combinationKey) {
-          const comboEntry = tryVariant(combinationKey) || tryColor(combinationKey);
-          if (comboEntry?.fileUrl) return { entry: comboEntry, key: combinationKey };
+        // Helper to check if current selections match a combination's requirements
+        const matchesCombination = (entry, currentSelections) => {
+          if (!entry?.accessoryMetadata || !Array.isArray(entry.accessoryMetadata)) {
+            return false;
+          }
+
+          // Build normalized sets of what's required and what's selected
+          const requiredVariants = new Set();
+          entry.accessoryMetadata.forEach((meta) => {
+            const vid = normalizeVariantId(meta?.variantId);
+            if (vid) requiredVariants.add(vid);
+          });
+
+          const selectedVariants = new Set();
+          currentSelections.forEach((sel) => {
+            const vid = normalizeVariantId(sel?.variantId);
+            if (vid) selectedVariants.add(vid);
+          });
+
+          // ALL required variants must be in the selection
+          // and the selection must have the SAME count (no extra accessories)
+          if (requiredVariants.size !== selectedVariants.size) return false;
+
+          for (const required of requiredVariants) {
+            if (!selectedVariants.has(required)) return false;
+          }
+
+          return true;
+        };
+
+        // If multiple accessories selected, try combination mapping
+        if (selections && selections.length > 1) {
+          // Build combination key from all variant IDs
+          const combinationKey = buildCombinationKey(
+            selections.map((sel) => sel?.variantId || sel?.accessoryId)
+          );
+
+          if (combinationKey) {
+            // Try the full combination key first
+            let comboEntry = tryVariant(combinationKey) || tryColor(combinationKey);
+            if (comboEntry?.fileUrl && comboEntry?.accessoryMetadata) {
+              // Verify ALL accessories in the combination are selected
+              if (matchesCombination(comboEntry, selections)) {
+                return { entry: comboEntry, key: combinationKey };
+              }
+            }
+
+            // Also try looking up by individual variant IDs in the combination
+            // The admin stores combo mappings under each individual variant ID too
+            for (const sel of selections) {
+              const keys = [
+                normalizeVariantId(sel?.variantId),
+                normalizeVariantId(sel?.accessoryGid),
+                sel?.accessoryId,
+                normalizeProductId(sel?.accessoryId),
+              ].filter(Boolean);
+
+              for (const key of keys) {
+                const entry = tryVariant(key) || tryColor(key);
+                // Skip entries without fileUrl
+                if (!entry?.fileUrl) continue;
+
+                console.log('🔎 Multi-select: Found entry for key:', key, {
+                  hasAccessoryMetadata: !!entry.accessoryMetadata,
+                  accessoryMetadataLength: entry.accessoryMetadata?.length,
+                  selectionsLength: selections.length
+                });
+
+                // If entry has accessoryMetadata, it's a combination mapping
+                if (entry.accessoryMetadata) {
+                  console.log('⚠️ Entry has accessoryMetadata - this is a combination mapping');
+                  // Verify ALL accessories in the combination are selected
+                  if (matchesCombination(entry, selections)) {
+                    console.log('✅ Combination match found!');
+                    return { entry, key: combinationKey };
+                  }
+                  console.log('❌ Combination does not match, skipping...');
+                  // If not all accessories match, skip this entry
+                  continue;
+                }
+
+                // If we get here, it's a single accessory mapping found in multi-select mode
+                // Return it (covers case where user selects multiple but only one has a mapping)
+                console.log('✅ Single accessory mapping found in multi-select mode');
+                return { entry, key };
+              }
+            }
+          }
         }
 
+        // Single accessory or fallback: try individual mappings (NOT combinations)
+        console.log('🔎 Trying single accessory fallback...');
         for (const sel of selections || []) {
           const keys = [
             normalizeVariantId(sel?.variantId),
@@ -609,11 +700,27 @@
           ].filter(Boolean);
           for (const key of keys) {
             const entry = tryVariant(key) || tryColor(key);
-            if (entry?.fileUrl) {
-              return { entry, key };
+            // Skip if no fileUrl
+            if (!entry?.fileUrl) continue;
+
+            console.log('🔎 Single fallback: Found entry for key:', key, {
+              hasAccessoryMetadata: !!entry.accessoryMetadata,
+              accessoryMetadata: entry.accessoryMetadata
+            });
+
+            // CRITICAL: Skip ALL combination mappings (entries with accessoryMetadata)
+            // These should ONLY be returned when ALL required accessories are selected
+            if (entry.accessoryMetadata) {
+              console.log('❌ Skipping combination mapping in single accessory mode');
+              continue;
             }
+
+            // This is a single accessory mapping, return it
+            console.log('✅ Returning single accessory mapping');
+            return { entry, key };
           }
         }
+        console.log('❌ No entry found');
         return null;
       };
 
